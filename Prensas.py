@@ -4,7 +4,7 @@ import datetime
 import time
 from pymcprotocol import Type3E
 from datetime import datetime, time as datetime_time, timedelta
-from itertools import product
+from itertools import product, cycle, chain
 import asyncio
 
 
@@ -20,7 +20,7 @@ PLC_IP = {
     # "MK25" : "10.1.2.69"
     }
 PLC_CONFIG = {
-    "2500T  TR": {"codigo_parte_A": "D2830", "No_parte_A": "D3680", "Contador_A": "D17000"},
+    "2500T  TR": {"PPC_A": "D2830", "No_parte_A": "D3680", "Contador_A": "D17000"},
     "1500T  TR": {"codigo_parte_A": "D2830", "No_parte_A": "D3680", "Contador_A": "D3210"},
     "1500T  TR2": {"codigo_parte_A": "D2830", "No_parte_A": "D3680", "Contador_A": "D3210"},
     "HOT STAMPING" : {"codigo_parte_A": "D2000", "No_parte_A": "W12A0", "Contador_A": "D5103"},
@@ -40,31 +40,29 @@ PLC_PORT = 5002       # Puerto de comunicación
 
 partes = ['A', 'B', 'C', 'D']
 
-
 def combinar_listas(cadena_limpia, contadores, tiempos):
-    # Si las listas tienen la misma longitud, usar zip directamente
-    if len(cadena_limpia) == len(contadores) == len(tiempos):
-        datos = list(zip(cadena_limpia, contadores, tiempos))
-    else:
-        # Si las listas tienen longitudes diferentes, usar cycle para repetir la lista más corta
-        datos = list(zip(cadena_limpia, cycle(contadores), tiempos))
-    
-    # Filtrar los datos: eliminar tuplas con elementos vacíos o None
-    # datos_filtrados = [item for item in datos if all(item) and item[0] != '']
-    
-    # Elimina las tuplas solo cuando el primer elemento está vacío ('') o es None
-    datos_filtrados = [item for item in datos if item and item[0] not in (None, '')]
+    datos = []
+    for i, cadena in enumerate(cadena_limpia):
+        if isinstance(cadena, list):
+            # Sí es una sublista, combinar cada elemento con el mismo contador y tiempo
+            for subcadena in cadena:
+                datos.append((subcadena, contadores[i], tiempos[i]))
+        elif cadena is not None and cadena != '':
+            # Si no es una sublista y no es None o vacío, combinar normalmente
+            datos.append((cadena, contadores[i], tiempos[i]))
 
+    # Eliminar cualquier tupla que tenga None o cadena vacía como primer elemento
+    datos_filtrados = [item for item in datos if item[0] not in (None, '')]
     return datos_filtrados
 
+
 def limpiar_cadena(cadena):
-    # print(cadena)
      #eliminar "\x00" y espacios
     cadena_limpia = cadena.replace("\x00", "")#.replace(" ", "")
+    # cadena_limpia = "DGH9 34 321/371"
     if '/' in cadena_limpia:
         # Si la cadena contiene "/", dividir primero por "-" y luego por "/"
         partes = [parte.split('/') for parte in cadena_limpia.split(' ')]
-        # Generar combinaciones usando product y concatenar en una sola línea
         return [''.join(combinacion) for combinacion in product(*partes)]
     else:
         return cadena_limpia.replace(" ", "")
@@ -88,7 +86,7 @@ def registro_cambio_turno(cursor, estacion, turno):
         # Separar no_parte y contadores
         no_parte = [resultado[1], resultado[4]]  # no_parte_A, no_parte_B
         contadores = [resultado[2], resultado[5]]  # contador_A, contador_B
-        modelos = [resultado[0], resultado[3]]
+        # modelos = [resultado[0], resultado[3]]
     else:
         # Si no hay resultados, devolver listas vacías
         no_parte = [None, None]
@@ -194,37 +192,28 @@ async def plc_historico(prensa, ip,config):
                 contadores = []
                 tiempos = []
 
-                # Determina cuántas partes vas a procesar dependiendo de la longitud de config
-                partes_a_procesar = min(len(config) // 3, len(partes))  # Cada parte tiene 3 claves: codigo_parte, contador, no_parte
+                # Obtener las partes presentes en el config
+                partes_en_config = [parte for parte in partes if f"Contador_{parte}" in config]
+                # print(partes_en_config)
+
+                for parte in partes_en_config:
+                    contador_clave = f"Contador_{parte}"
+                    no_parte_clave = f"No_parte_{parte}"
+                    PPC_clave = f"PPC_{parte}"
+
+                    # Lee los valores del PLC y los agrega a las listas
+                    contadores.append(plc.batchread_wordunits(headdevice=config.get(contador_clave), readsize=1)[0])
+
+                    try:
+                        tiempos.append(abs(int(plc.batchread_wordunits(headdevice=config.get(PPC_clave), readsize=1)[0]) / 1000))
+                    except (ValueError, TypeError) as e:
+                        print(f"Error procesando valor: {e}")
+                        tiempos.append(0.0)  # Valor por defecto en caso de error
+
+                    # Lee la cadena si existe, sino agrega None
+                    cadena.append(plc.batchread_wordunits(headdevice=config.get(no_parte_clave), readsize=8) if config.get(no_parte_clave) else None)
 
 
-                for i, parte in enumerate(partes):
-                    if i < partes_a_procesar:  # Procesa solo las partes que correspondan
-                        contador_clave = f"Contador_{parte}"
-                        no_parte_clave = f"No_parte_{parte}"
-                        PPC_clave = f"PPC_{parte}"
-
-                        # Lee los valores del PLC y los agrega a las listas
-                        contadores.append(plc.batchread_wordunits(headdevice=config.get(contador_clave), readsize=1)[0])
-
-        
-                        # tiempos.append(plc.batchread_wordunits(headdevice=config.get(PPC_clave), readsize=1)[0])
-
-                        try:
-                            tiempos.append(abs(int(plc.batchread_wordunits(headdevice=config.get(PPC_clave), readsize=1)[0]) / 1000))
-                        except (ValueError, TypeError) as e:
-                            print(f"Error procesando valor: {e}")
-                            tiempos.append(0.0)  # Valor por defecto en caso de error
-
-                        # Lee la cadena si existe, sino agrega None
-                        cadena.append(plc.batchread_wordunits(headdevice=config.get(no_parte_clave), readsize = 8)) if config.get(no_parte_clave) else cadena.append(None)
-                    else:
-                        # Asignar null (None en Python) a las partes que no se procesarán
-                        tiempos.append(None)
-                        contadores.append(None)
-                        cadena.append(None)
-
-                # print(cadena
                 cadena_limpia = []
                 for bloque in cadena:
                     if bloque is None:  # Verifica si el bloque es None
@@ -239,7 +228,6 @@ async def plc_historico(prensa, ip,config):
                         ascii_char = caracter_bajo + caracter_alto
                         ascii_value += ascii_char
                     cadena_limpia.append(limpiar_cadena(ascii_value))  # Agregar el resultado de cada lista al total
-                # print(cadena_limpia)
                 
                 # Obtener la fecha y hora actual
                 fecha_actual = datetime.now()
@@ -248,27 +236,6 @@ async def plc_historico(prensa, ip,config):
                 fecha_formateada = fecha_actual.strftime('%Y-%m-%d %H:%M:%S')
                 # Obtener solo la hora actual
                 hora_actual = fecha_actual.time()
-                
-                
-                # # Obtener solo la fecha actual
-                # solo_fecha = fecha_actual.date()
-                # # Definir los intervalos de tiempo para los turnos
-                # inicio_turno_dia = datetime_time(8, 0, 0)
-                # fin_turno_dia = datetime_time(20, 0, 0)
-                # inicio_dia = datetime_time(0, 0, 0)
-
-                # # Dia: 1	D	Diurno
-                # # noche: 2	N	Nocturno
-                # # Determinar el turno
-                # if inicio_turno_dia <= hora_actual < fin_turno_dia:
-                #     turno = 1
-                # else:
-                #     turno = 2
-                #     if fin_turno_dia <= hora_actual < inicio_dia:
-                #         solo_fecha = solo_fecha
-                #     else:
-                #         # Restar un día a solo_fecha
-                #         solo_fecha = solo_fecha - timedelta(days=1)
                 
                 TURNO_DIURNO_INICIO = datetime_time(8, 0, 0)
                 TURNO_DIURNO_FIN = datetime_time(20, 0, 0)
@@ -280,13 +247,6 @@ async def plc_historico(prensa, ip,config):
                     turno = 2
                     fecha_ajustada = fecha_actual.date() - timedelta(days=1) if hora_actual < TURNO_DIURNO_INICIO else fecha_actual.date()
 
-                
-                
-                data.append({"Estacion": estacion ,"Tiempo_Ciclo_A": tiempos[0] , "No_parte_A": cadena_limpia[0], "Contador_A": contadores[0],
-                                                    "Tiempo_Ciclo_B": tiempos[1] ,"No_parte_B": cadena_limpia[1], "Contador_B": contadores[1], "Turno": turno,"Fecha": fecha_formateada})
-                df = pd.DataFrame(data)
-
-                print(df)
 
 
                 # no_parte_cambio_turno, contadores_cambio_turno, modelos_cambio_turno= registro_cambio_turno(cursor, estacion, turno)
@@ -321,9 +281,20 @@ async def plc_historico(prensa, ip,config):
 
                 else:
 
-                    
                     datos_filtrados = combinar_listas(cadena_limpia, contadores, tiempos)
-                    print(len(datos_filtrados))
+
+                    # Crear un DataFrame con los datos filtrados
+                    df = pd.DataFrame(datos_filtrados, columns=['Numero_Parte', 'Contador', 'Tiempo_Ciclo'])
+
+                    # Agregar columnas de estación y fecha
+                    df['Estacion'] = estacion
+                    df['Fecha'] = fecha_formateada
+
+                    # Reordenar las columnas para que Estacion y Fecha aparezcan primero
+                    df = df[['Estacion', 'Numero_Parte', 'Contador', 'Tiempo_Ciclo', 'Fecha']]
+
+                    # Imprimir el DataFrame usando to_markdown()
+                    print(df.to_markdown(index=False))
                     
                     if not datos_filtrados:
                         print("No hay datos para procesar")
@@ -340,10 +311,8 @@ async def plc_historico(prensa, ip,config):
                                         AND pr.status_id = 7
                                 '''
                         cursor.execute(sql_update_status, estacion, fecha_ajustada, turno)
-                    print(datos_filtrados)
 
                     for numero_parte, contador, tiempo in datos_filtrados:
-
                         sql_get_record = '''
                                         SELECT TOP 1
                                             pr.id,
@@ -368,7 +337,7 @@ async def plc_historico(prensa, ip,config):
                         # Ejecutar la consulta con los parámetros adicionales
                         cursor.execute(sql_get_record, (estacion, fecha_ajustada, turno, numero_parte))
                         resultado = cursor.fetchone()
-                        
+
 
  
                         # Verificar si el registro existe
@@ -446,7 +415,7 @@ async def plc_historico(prensa, ip,config):
                                         JOIN work_centers wc ON pn.work_center_id = wc.id
                                         WHERE pn.number = ? AND wc.name = ?;
                                         '''
-                            cursor.execute(query_id, (numero_parte, estacion))
+                            cursor.execute(query_id,( numero_parte, estacion))
                             part_number_id = cursor.fetchone()
 
                             if part_number_id:
@@ -468,26 +437,30 @@ async def plc_historico(prensa, ip,config):
                                         INSERT INTO histories (part_number_id, quantity, created_at, production_per_cycle)
                                         VALUES (?, ?, ?, ?);
                                     '''
-                                    cursor.execute(sql_insert, (part_number_id, contador, fecha_formateada, tiempo))  
-
+                                    cursor.execute(sql_insert, (part_number_id, contador, fecha_formateada, tiempo))
 
 
 
 
             
-            # print(f"Tiempo total: {time.time() - start_time:.2f} segundos")
+
             # Confirma la transacción
             conn.commit()
-            # time.sleep(1)
-            await asyncio.sleep(.7)
-            
-    
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            remaining_time = max(1 - elapsed_time, 0)
+            await asyncio.sleep(remaining_time)
+
+            # print(f"Tiempo de procesamiento: {elapsed_time:.2f} segundos")
+            # print(f"Tiempo de espera: {remaining_time:.2f} segundos")
+
+
 
 
 
 
             plc.close()
-    
+
         except Exception as e:
             # cursor.close()
             # connection.close()
@@ -536,7 +509,6 @@ asyncio.run(main())
         
 #     # Usar map para ejecutar la tarea en paralelo con las claves y valores
 #     plc_historico.map(keys, values)
-
 
 
  
