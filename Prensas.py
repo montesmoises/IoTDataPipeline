@@ -6,9 +6,7 @@ from pymcprotocol import Type4E
 from datetime import datetime, time as datetime_time, timedelta
 from itertools import product, cycle, chain
 import asyncio
-# import uvloop
 
-# uvloop.install()
 
 # Configura los detalles del PLC, ip y puerto
 PLC_IP = {
