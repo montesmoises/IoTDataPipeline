@@ -2,22 +2,23 @@ import pandas as pd
 import pyodbc
 import datetime
 import time
-from pymcprotocol import Type3E
+from pymcprotocol import Type4E
 from datetime import datetime, time as datetime_time, timedelta
 from itertools import product, cycle, chain
 import asyncio
+# import uvloop
 
-
+# uvloop.install()
 
 # Configura los detalles del PLC, ip y puerto
 PLC_IP = {
-    # "2500T  TR" : "10.1.1.1",
+    "2500T  TR" : "10.1.1.1",
     # "1500T  TR" : "10.1.1.7",
     # "1500T  TR2" : "10.1.1.3",
     # "HOT STAMPING" : "10.1.1.4",
     # "HOT STAMPING 2" : "10.1.1.5",
     "MK05                          " : "10.1.2.1",
-    # "MK25" : "10.1.2.69"
+    # "PW" : "10.1.2.69"
     }
 PLC_CONFIG = {
     "2500T  TR": {"PPC_A": "D2830", "No_parte_A": "D3680", "Contador_A": "D17000"},
@@ -25,7 +26,7 @@ PLC_CONFIG = {
     "1500T  TR2": {"codigo_parte_A": "D2830", "No_parte_A": "D3680", "Contador_A": "D3210"},
     "HOT STAMPING" : {"codigo_parte_A": "D2000", "No_parte_A": "W12A0", "Contador_A": "D5103"},
     "HOT STAMPING 2" : {"codigo_parte_A": "D20000", "No_parte_A": "D20412", "Contador_A": "W120A"},
-    "MK05                          ": {"No_parte_A": "D3104", "Contador_A": "D3100","PPC_A": "D8180", "No_parte_B": "D3112", "Contador_B": "D3101", "PPC_B": "D8182"},
+    "MK05                          ": {"No_parte_A": "D3104", "Contador_A": "D3100","PPC_A": "D8180", "No_parte_B": "D3115", "Contador_B": "D3101", "PPC_B": "D8182"},
     "MK25": {"codigo_parte_A": "D6500"}
     
 }
@@ -161,29 +162,22 @@ def insertar_historico(cursor, numero_parte, contador, turno, fecha_formateada, 
 
 
 async def plc_historico(prensa, ip,config):
-    # connection = pyodbc.connect(
-    #     'DRIVER={ODBC Driver 17 for SQL Server};'
-    #     'SERVER=192.168.120.13;'
-    #     'DATABASE=IOT_YKM;'
-    #     'UID=sa;'
-    #     'PWD=Alcala91'
-    #     )
-    # cursor = connection.cursor()
-    # conn = create_connection()
-    # cursor = conn.cursor()
+   
     while True:
+        conn = None
+        plc = None
         try:
             conn = create_connection()
-            # Usar un bloque with para manejar el cursor
             with conn.cursor() as cursor:
-
                 start_time = time.time()
-
-                plc = Type3E(plctype="Q")
-                plc.soc_timeout = 10  # Tiempo de espera del socket en segundos
-
-                # Intenta conectar al PLC   
-                plc.connect(ip, PLC_PORT)
+                
+                plc = Type4E(plctype="Q")
+                plc.soc_timeout = 5
+                
+                # Intenta conectar al PLC
+                await asyncio.to_thread(plc.connect, ip, PLC_PORT)
+                
+                
                 estacion = prensa
                 
                 
@@ -211,7 +205,7 @@ async def plc_historico(prensa, ip,config):
                         tiempos.append(0.0)  # Valor por defecto en caso de error
 
                     # Lee la cadena si existe, sino agrega None
-                    cadena.append(plc.batchread_wordunits(headdevice=config.get(no_parte_clave), readsize=8) if config.get(no_parte_clave) else None)
+                    cadena.append(plc.batchread_wordunits(headdevice=config.get(no_parte_clave), readsize=10) if config.get(no_parte_clave) else None)
 
 
                 cadena_limpia = []
@@ -249,6 +243,7 @@ async def plc_historico(prensa, ip,config):
 
 
 
+
                 # no_parte_cambio_turno, contadores_cambio_turno, modelos_cambio_turno= registro_cambio_turno(cursor, estacion, turno)
 
                 turno1 = 'D'
@@ -266,11 +261,9 @@ async def plc_historico(prensa, ip,config):
                     
                 elif turno1 == 'N':    
                 # elif  no_parte_cambio_turno == cadena_limpia and modelos_cambio_turno == codigo_partes:
-                    print(no_parte_cambio_turno)
-                    print(cadena_limpia)
+                    
                     print("sigue la misma pieza")
-                    print(contadores)
-                    print(contadores_cambio_turno)
+                    
 
 
                     # realiza la operacion si las variables no son None
@@ -278,7 +271,7 @@ async def plc_historico(prensa, ip,config):
                     operacion1 = None if contadores[1] is None or contadores_cambio_turno[1] is None else contadores[1] - contadores_cambio_turno[1]
 
                     actualizar_historico(cursor, estacion, turno, operacion0, operacion1, fecha_formateada)
-
+            
                 else:
 
                     datos_filtrados = combinar_listas(cadena_limpia, contadores, tiempos)
@@ -320,7 +313,7 @@ async def plc_historico(prensa, ip,config):
                                             pr.produced_quantity,
                                             pr.status_id,
                                             pr.planned_quantity,
-                                            pn.number AS part_number,
+                                            pn.id AS part_number_id,
                                             wc.name AS work_center
                                         FROM production_records pr
                                         JOIN part_numbers pn ON pr.part_number_id = pn.id
@@ -368,7 +361,7 @@ async def plc_historico(prensa, ip,config):
                                         actualizar_historico(cursor, contador, statuses, fecha_formateada, fecha_start, record_id)
                             elif contador < resultado.produced_quantity:
                                 statuses = 24
-                                print("entra en este")
+                                print("entra en este arreglar")
                                 planned_date = fecha_ajustada # fecha de prueba
                                 insertar_historico(cursor, resultado.part_number_id, contador, turno, fecha_formateada, statuses, planned_date)
 
@@ -396,7 +389,7 @@ async def plc_historico(prensa, ip,config):
                                 with open("logs.txt", "r") as log_file:
                                     logs = log_file.readlines()
                                 
-                                error_message = f"{fecha_actual.date()} - Error: No se encontró el número de parte en el workcenter {estacion}: {numero_parte}\n"
+                                error_message = f"{fecha_actual.date()} - Error: No se encontró el número de parte en el workcenter {estacion}: {ascii_value}\n"
                                 
                                 # Si el error no está en los logs, agregarlo
                                 if error_message not in logs:
@@ -440,77 +433,85 @@ async def plc_historico(prensa, ip,config):
                                     cursor.execute(sql_insert, (part_number_id, contador, fecha_formateada, tiempo))
 
 
+                conn.commit()
+                elapsed_time = time.time() - start_time
+                await asyncio.sleep(max(1 - elapsed_time, 1))  # Mínimo 0.5s de espera
 
 
             
 
-            # Confirma la transacción
-            conn.commit()
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            remaining_time = max(1 - elapsed_time, 0)
-            await asyncio.sleep(remaining_time)
 
-            # print(f"Tiempo de procesamiento: {elapsed_time:.2f} segundos")
-            # print(f"Tiempo de espera: {remaining_time:.2f} segundos")
-
-
-
-
-
-
-            plc.close()
 
         except Exception as e:
-            # cursor.close()
-            # connection.close()
-            print(f"Error al conectar al PLC: {e}")
-            #Cierra la conexión
-            cursor.close()
-            # connection.close()
-            conn.close()
-            plc.close()
-            break  # Rompe el bucle en caso de error
+            print(f"Error en {prensa}: {str(e)}")
+            await asyncio.sleep(2)  # Espera antes de reintentar
         finally:
-            # Cierra la conexión
-            cursor.close()
-            # connection.close()
-            conn.close()
-            plc.close()
+            # Cerrar recursos solo si existen
+            try:
+                if plc and plc._is_connected:
+                    await asyncio.to_thread(plc.close)
+            except Exception as e:
+                print(f"Error cerrando PLC: {str(e)}")
+            
+            try:
+                if conn:
+                    conn.close()
+            except Exception as e:
+                print(f"Error cerrando conexión: {str(e)}")
 
-async def supervisor(PLC_IP, PLC_CONFIG):
-    tasks = {}
-
-    # Crear tareas para cada prensa en el diccionario PLC_IP
-    for nombre_prensa, ip in PLC_IP.items():
-        config = PLC_CONFIG.get(nombre_prensa, {})
-        tasks[nombre_prensa] = asyncio.create_task(plc_historico(nombre_prensa, ip, config))
+# Versión síncrona wrapper
+def plc_historico_sync(prensa):
+    # Obtener configuración desde los diccionarios globales
+    ip = PLC_IP[prensa]
+    config = PLC_CONFIG.get(prensa, {})
     
-    while True:
-        for nombre_prensa, task in tasks.items():
-            if task.done():  # Verifica si la tarea ha terminado
-                print(f"Tarea de {nombre_prensa} se ha detenido, reiniciando...")
-                tasks[nombre_prensa] = asyncio.create_task(plc_historico(nombre_prensa, PLC_IP[nombre_prensa], config))
-        await asyncio.sleep(3)  # Intervalo para chequear las tareas
+    # Crear nuevo event loop para el hilo
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Ejecutar la versión async en este loop
+        loop.run_until_complete(plc_historico(prensa, ip, config))
+    except Exception as e:
+        print(f"Error crítico en {prensa}: {str(e)}")
+    finally:
+        # Limpieza profesional del loop
+        loop.close()
+        asyncio.set_event_loop(None)
+        
+async def supervisor(PLC_IP, PLC_CONFIG):
+    import concurrent.futures
+    
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(PLC_IP),
+        thread_name_prefix="PLC_"
+    )
+
+    # Función de lanzamiento por prensa
+    def run_press(prensa):
+        while True:  # Bucle infinito de autoreparación
+            try:
+                plc_historico_sync(prensa)
+            except Exception as e:
+                print(f"Reinicio en 1s: {prensa} - {str(e)}")
+                time.sleep(1)
+
+    # Lanzar todas las prensas en paralelo REAL
+    with executor as exe:
+        # Mapear cada prensa a un future
+        futures = {exe.submit(run_press, prensa): prensa for prensa in PLC_IP}
+        
+        # Supervisar estados
+        while True:
+            await asyncio.sleep(1)  # Mantener el supervisor activo
 
 
 async def main():
-    await supervisor(PLC_IP, PLC_CONFIG)
+    # Iniciar supervisor en segundo plano
+    supervisor_task = asyncio.create_task(supervisor(PLC_IP, PLC_CONFIG))
+    
+    # Mantener el programa activo
+    await asyncio.Event().wait()  # Bloqueo infinito
 
-asyncio.run(main())
-
-# def main():
-#     # plc_historico()
-#     # Crear un flujo de trabajo
-        
-#     # Descomponer el diccionario en claves y valores
-#     keys = list(PLC_IP.keys())
-#     values = list(PLC_IP.values())
-        
-#     # Usar map para ejecutar la tarea en paralelo con las claves y valores
-#     plc_historico.map(keys, values)
-
-
- 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    asyncio.run(main())
