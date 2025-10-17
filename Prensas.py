@@ -82,21 +82,21 @@ CSV_FILE = CSV_DIR / "parts_not_found.csv"
 
 def create_connection():
     """Crea conexión a SQL Server"""
-    # connection = pyodbc.connect(
-    #     'DRIVER={ODBC Driver 17 for SQL Server};'
-    #     'SERVER=192.168.130.87;'
-    #     'DATABASE=test_iot;'
-    #     'UID=sa;'
-    #     'PWD=Alcala91'
-    # )
-
     connection = pyodbc.connect(
         'DRIVER={ODBC Driver 17 for SQL Server};'
-        'SERVER=192.168.130.47;' # cambiar ip de migue
-        'DATABASE=IOT_YKM;'
+        'SERVER=192.168.130.87;'
+        'DATABASE=test_iot;'
         'UID=sa;'
-        'PWD=Password9'
+        'PWD=Alcala91'
     )
+
+    # connection = pyodbc.connect(
+    #     'DRIVER={ODBC Driver 17 for SQL Server};'
+    #     'SERVER=192.168.130.47;' # cambiar ip de migue
+    #     'DATABASE=IOT_YKM;'
+    #     'UID=sa;'
+    #     'PWD=Password9'
+    # )
     return connection
 
 def crear_conexion_as400(host: str = "192.168.200.7", user: str = "QSECOFR",
@@ -465,9 +465,24 @@ def decodificar_bloque(bloque):
     return cadena_original, cadena_limpia
 
 def expand_block(address: str, length: int) -> list[str]:
-    """Dado un address tipo "D3100" y un length n, devuelve ["D3100","D3101",...,"D3100+(n-1)"]"""
+    """
+    Dado un address tipo "W12A0" y un length n, devuelve ["W12A0","W12A1",...,"W12A0+(n-1)"]
+    Dado un address tipo "D3100" y un length n, devuelve ["D3100","D3101",...,"D3100+(n-1)"]
+    """
+    # Si es dispositivo W y tiene formato como W12A0
+    if address.startswith('W') and any(c in 'ABCDEF' for c in address):
+        # Extraer componentes: W12A0 -> W, 12A, 0
+        import re
+        match = re.match(r'([W])([0-9]*[A-F]?)([0-9]+)$', address)
+        if match:
+            prefix = match.group(1)
+            middle = match.group(2)
+            last_num = int(match.group(3))
+            return [f"{prefix}{middle}{last_num + i}" for i in range(length)]
+
+    # Para todos los otros casos, usar el método original
     prefix = ''.join(ch for ch in address if not ch.isdigit())
-    num    = int(''.join(ch for ch in address if ch.isdigit()))
+    num = int(''.join(ch for ch in address if ch.isdigit()))
     return [f"{prefix}{num + i}" for i in range(length)]
 
 # ────────────────────────────────────────── LÓGICA DE LECTURA PLC ─────────────────────────────────────────────────────
