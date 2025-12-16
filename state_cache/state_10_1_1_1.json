@@ -1,12 +1,12 @@
 {
-    "2500T TR_BDWK34831": {
-        "id_registro": 163,
-        "quantity_planeada": 0,
+    "2500T  TR_BDTS54426": {
+        "id_registro": 51616,
+        "quantity_planeada": 900,
         "corrida_previa": 0,
         "multiplicador": 1,
-        "contador_registro": 19,
+        "contador_registro": 840,
         "cnt_turn_start": 0,
-        "hora_cambio": "15:31:19",
-        "numero_original": "BDWK34831/841"
+        "hora_cambio": "17:29:44",
+        "numero_original": "BDTS54426"
     }
 }

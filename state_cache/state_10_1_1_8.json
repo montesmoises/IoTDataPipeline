@@ -1,0 +1,12 @@
+{
+    "600T   AP_BDTS34832/842 -BK": {
+        "id_registro": 51720,
+        "quantity_planeada": 3300,
+        "corrida_previa": 0,
+        "multiplicador": 1,
+        "contador_registro": 829,
+        "cnt_turn_start": 0,
+        "hora_cambio": "17:28:56",
+        "numero_original": "BDTS34832/842"
+    }
+}

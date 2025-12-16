@@ -15,12 +15,16 @@ import threading
 import re
 import json
 import traceback
+from dotenv import load_dotenv  # Para cargar variables del entorno
 
 # CustomTkinter para la nueva UI
 import customtkinter as ctk
 from tkinter import ttk, StringVar
 
 # ═══════════════════════════ CONFIGURACIÓN GLOBAL ═══════════════════════════
+
+# Cargar variables del entorno desde .env
+load_dotenv()
 
 # Directorios
 LOGS_DIR = Path("logs")
@@ -128,18 +132,28 @@ def get_station_logger(estacion):
 # ═══════════════════════════ CONEXIONES BD ═══════════════════════════
 
 def create_connection():
-    """Crea conexión a SQL Server"""
+    """Crea conexión a SQL Server usando variables del entorno"""
+    server = os.getenv('DB_SERVER')
+    database = os.getenv('DB_NAME')
+    username = os.getenv('DB_USER')
+    password = os.getenv('DB_PASSWORD')
+
     return pyodbc.connect(
-        'DRIVER={ODBC Driver 17 for SQL Server};'
-        'SERVER=192.168.130.87;'
-        'DATABASE=test_iot;'
-        'UID=sa;'
-        'PWD=Alcala91'
+        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
+        f'SERVER={server};'
+        f'DATABASE={database};'
+        f'UID={username};'
+        f'PWD={password}'
     )
 
-def crear_conexion_as400(host: str = "192.168.200.7", user: str = "QSECOFR",
-                        password: str = "AS400300", database: str = "") -> Optional[pyodbc.Connection]:
-    """Crea conexión a AS400"""
+def crear_conexion_as400(host: str = None, user: str = None,
+                        password: str = None, database: str = "") -> Optional[pyodbc.Connection]:
+    """Crea conexión a AS400 usando variables del entorno"""
+
+    host = host or os.getenv('AS400_HOST')
+    user = user or os.getenv('AS400_USER')
+    password = password or os.getenv('AS400_PASSWORD')
+
     conn_str = f"DRIVER={{iSeries Access ODBC Driver}};SYSTEM={host};UID={user};PWD={password};"
     if database:
         conn_str += f"DBQ={database};"
@@ -352,6 +366,9 @@ def decodificar_bloque(bloque, estacion=None, area=None):
     chars = [chr(v & 0xFF) + chr((v >> 8) & 0xFF) for v in bloque]
     original = "".join(chars).replace("\x00", "")
     limpia = original.strip()
+
+    if not limpia:
+        return original, [], {}
 
     if not area or "estampado" not in str(area).lower():
         return original, [limpia], {}
@@ -673,10 +690,10 @@ class IPDataProcessor:
             with conn.cursor() as cursor:
                 hora = now.time().replace(microsecond=0)
 
-                if time(8,0) <= hora < time(16,49):
+                if time(8,0) <= hora < time(20,0):
                     turno = 1
                     fecha_plan = now.date()
-                elif hora >= time(16,49):
+                elif hora >= time(20,0):
                     turno = 2
                     fecha_plan = now.date()
                 else:
@@ -791,7 +808,7 @@ class IPDataProcessor:
 
                     cambio_turno = (
                         (reg["hora_cambio"] < time(8, 0) <= hora) or
-                        (reg["hora_cambio"] < time(16, 49) <= hora)
+                        (reg["hora_cambio"] < time(20, 0) <= hora)
                     )
 
                     if cambio_turno:
@@ -889,6 +906,16 @@ system_monitor = {'ips': {}, 'estaciones': {}, 'estadisticas': {'errores_conexio
 
 async def plc_reader(ip, port, group_info):
     plc = Type3E()
+    plc.network = 0
+    plc.pc = 0xFF
+    plc.timer = 30  # 🔥 AUMENTADO: Tiempo de espera para respuesta del PLC (30 segundos)
+
+    # 🔥 NUEVO: Configurar socket timeout directamente
+    try:
+        plc.soc_timeout = 10.0  # Timeout del socket en segundos
+    except:
+        pass
+
     connected = False
     collector = IPDataCollector(ip, group_info['estaciones'], group_info.get('area', 'Default'))
 
@@ -911,12 +938,22 @@ async def plc_reader(ip, port, group_info):
                 }
 
             await collector.collect_and_enqueue(plc, group_info)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1)  # 🔥 CAMBIADO: De 0.1 a 1 segundo entre lecturas
 
         except Exception as e:
             connected = False
-            for est in group_info['estaciones']:
-                get_station_logger(est).error(f"⚠️ PLC OFFLINE {ip}: {e}")
+            error_msg = str(e)
+
+            # 🔥 NUEVO: Mensajes de error más descriptivos
+            if "Invalid device" in error_msg:
+                for est in group_info['estaciones']:
+                    get_station_logger(est).error(f"❌ PLC {ip} - DIRECCIÓN INVÁLIDA: {error_msg}")
+            elif "timed out" in error_msg:
+                for est in group_info['estaciones']:
+                    get_station_logger(est).error(f"⏱️ PLC {ip} - TIMEOUT: No responde en el tiempo límite")
+            else:
+                for est in group_info['estaciones']:
+                    get_station_logger(est).error(f"⚠️ PLC OFFLINE {ip}: {e}")
 
             if ip in system_monitor['ips']:
                 system_monitor['ips'][ip]['conectado'] = False
@@ -1197,6 +1234,7 @@ def start_async():
     loop.run_until_complete(supervisor())
 
 if __name__ == '__main__':
+
     t = threading.Thread(target=start_async, daemon=True)
     t.start()
     app = ModernDashboardUI()
