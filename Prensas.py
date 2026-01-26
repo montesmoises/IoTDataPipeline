@@ -2,12 +2,13 @@ import pandas as pd
 import datetime
 import time as system_time
 from pymcprotocol import Type3E
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date
 from itertools import product, cycle, chain
 from collections import namedtuple, defaultdict
 import asyncio, hashlib, pyodbc
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
@@ -15,7 +16,8 @@ import threading
 import re
 import json
 import traceback
-from dotenv import load_dotenv  # Para cargar variables del entorno
+from dotenv import load_dotenv
+from logging.handlers import RotatingFileHandler
 
 # CustomTkinter para la nueva UI
 import customtkinter as ctk
@@ -34,11 +36,31 @@ CSV_DIR.mkdir(exist_ok=True)
 STATE_DIR = Path("state_cache")
 STATE_DIR.mkdir(exist_ok=True)
 
-# Configurar logging
+# Configurar logging CON ROTACIÓN
 logging.basicConfig(level=logging.NOTSET, handlers=[])
 logger = logging.getLogger("supervisor")
 logger.setLevel(logging.INFO)
 logger.propagate = False
+
+# 🔄 Handler con rotación para el logger principal
+supervisor_log_path = LOGS_DIR / "supervisor.log"
+supervisor_file_handler = RotatingFileHandler(
+    supervisor_log_path,
+    mode='a',
+    encoding='utf-8',
+    maxBytes=100*1024*1024,  # 10 MB
+    backupCount=2           # 5 backups
+)
+supervisor_file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+supervisor_file_handler.setFormatter(formatter)
+logger.addHandler(supervisor_file_handler)
+
+#  Handler para consola (solo INFO y superior)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)  # Solo INFO, WARNING, ERROR
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 station_loggers = {}
 
@@ -48,83 +70,514 @@ POLL_INTERVAL = 5
 # Archivo CSV de números de parte no encontrados
 CSV_FILE = CSV_DIR / "parts_not_found.csv"
 
-# 🔥 NUEVO: Función helper para guardar errores de validación
-def registrar_error_validacion(estacion, numero_original, tipo_error):
+#  CONFIGURACIÓN GLOBAL DE CONEXIÓN PLC
+PLC_CONNECTION_TIMEOUT = 5  # 5 segundos de timeout
+PLC_READ_TIMEOUT = 3        # 3 segundos para lectura
+RECONNECT_DELAY = 10        # 10 segundos entre reconexiones fallidas
+
+# ═══════════════════════════ POOL DE CONEXIONES ═══════════════════════════
+
+class ConnectionPool:
+    """Pool simple para reutilizar conexiones"""
+
+    _sql_pool = {}  # {connection_key: (conn, last_used)}
+    _as400_pool = {}  # {connection_key: (conn, last_used)}
+    _cleanup_interval = 300  # Limpiar conexiones inactivas cada 300 segundos
+    _max_idle_time = 600  # Max 10 minutos inactiva
+    _lock = threading.RLock()
+
+    @classmethod
+    def get_sql_connection(cls):
+        """Obtiene o crea conexión SQL reutilizable"""
+        with cls._lock:
+            current_time = datetime.now()
+            connection_key = "default_sql"
+
+            # Limpiar conexiones antiguas periódicamente
+            if hasattr(cls, '_last_cleanup'):
+                if (current_time - cls._last_cleanup).total_seconds() > cls._cleanup_interval:
+                    cls._cleanup_old_connections()
+                    cls._last_cleanup = current_time
+            else:
+                cls._last_cleanup = current_time
+
+            # Reutilizar conexión existente si está disponible y válida
+            if connection_key in cls._sql_pool:
+                conn, last_used = cls._sql_pool[connection_key]
+
+                # Verificar si la conexión sigue viva
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1")
+                    cursor.fetchone()
+
+                    # Actualizar tiempo de uso
+                    cls._sql_pool[connection_key] = (conn, current_time)
+
+                    # Log solo la primera vez
+                    if not hasattr(cls, '_sql_reused_logged'):
+                        logger.debug("♻️ Reutilizando conexión SQL existente")
+                        cls._sql_reused_logged = True
+
+                    return conn
+                except:
+                    # Conexión muerta, cerrar y crear nueva
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    del cls._sql_pool[connection_key]
+
+            # Crear nueva conexión
+            conn = cls._create_sql_connection()
+            if conn:
+                cls._sql_pool[connection_key] = (conn, current_time)
+                logger.debug("🔗 Nueva conexión SQL creada para pool")
+
+            return conn
+
+    @classmethod
+    def _create_sql_connection(cls):
+        """Crea una nueva conexión SQL (sin loggear cada vez)"""
+        server = os.getenv('DB_SERVER')
+        database = os.getenv('DB_NAME')
+        username = os.getenv('DB_USER')
+        password = os.getenv('DB_PASSWORD')
+
+        if not all([server, database, username, password]):
+            return None
+
+        try:
+            connection_string = (
+                f'DRIVER={{ODBC Driver 17 for SQL Server}};'
+                f'SERVER={server};'
+                f'DATABASE={database};'
+                f'UID={username};'
+                f'PWD={password};'
+                f'Connect Timeout=10;'
+            )
+
+            conn = pyodbc.connect(connection_string)
+            return conn
+        except Exception:
+            return None
+
+    @classmethod
+    def get_as400_connection(cls):
+        """Obtiene o crea conexión AS400 reutilizable"""
+        with cls._lock:
+            current_time = datetime.now()
+            connection_key = "default_as400"
+
+            # Reutilizar conexión existente si está disponible y válida
+            if connection_key in cls._as400_pool:
+                conn, last_used = cls._as400_pool[connection_key]
+
+                # Verificar si la conexión sigue viva (timeout de 5 segundos)
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1 FROM SYSIBM.SYSDUMMY1")
+                    cursor.fetchone()
+
+                    # Actualizar tiempo de uso
+                    cls._as400_pool[connection_key] = (conn, current_time)
+
+                    # Log solo la primera vez
+                    if not hasattr(cls, '_as400_reused_logged'):
+                        logger.debug("♻️ Reutilizando conexión AS400 existente")
+                        cls._as400_reused_logged = True
+
+                    return conn
+                except:
+                    # Conexión muerta, cerrar y crear nueva
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    del cls._as400_pool[connection_key]
+
+            # Crear nueva conexión
+            conn = cls._create_as400_connection()
+            if conn:
+                cls._as400_pool[connection_key] = (conn, current_time)
+                logger.debug("🔗 Nueva conexión AS400 creada para pool")
+
+            return conn
+
+    @classmethod
+    def _create_as400_connection(cls):
+        """Crea una nueva conexión AS400"""
+        host = os.getenv('AS400_HOST')
+        user = os.getenv('AS400_USER')
+        password = os.getenv('AS400_PASSWORD')
+
+        if not all([host, user, password]):
+            return None
+
+        try:
+            conn_str = f"DRIVER={{iSeries Access ODBC Driver}};SYSTEM={host};UID={user};PWD={password};"
+            conn = pyodbc.connect(conn_str)
+            return conn
+        except Exception:
+            return None
+
+    @classmethod
+    def _cleanup_old_connections(cls):
+        """Limpia conexiones inactivas"""
+        with cls._lock:
+            current_time = datetime.now()
+
+            # Limpiar SQL
+            keys_to_remove = []
+            for key, (conn, last_used) in cls._sql_pool.items():
+                if (current_time - last_used).total_seconds() > cls._max_idle_time:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    keys_to_remove.append(key)
+
+            for key in keys_to_remove:
+                del cls._sql_pool[key]
+
+            if keys_to_remove:
+                logger.debug(f"🧹 Limpiadas {len(keys_to_remove)} conexiones SQL inactivas")
+
+            # Limpiar AS400
+            keys_to_remove = []
+            for key, (conn, last_used) in cls._as400_pool.items():
+                if (current_time - last_used).total_seconds() > cls._max_idle_time:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    keys_to_remove.append(key)
+
+            for key in keys_to_remove:
+                del cls._as400_pool[key]
+
+            if keys_to_remove:
+                logger.debug(f"🧹 Limpiadas {len(keys_to_remove)} conexiones AS400 inactivas")
+
+    @classmethod
+    def close_all(cls):
+        """Cierra todas las conexiones (para shutdown)"""
+        with cls._lock:
+            for conn, _ in cls._sql_pool.values():
+                try:
+                    conn.close()
+                except:
+                    pass
+
+            for conn, _ in cls._as400_pool.values():
+                try:
+                    conn.close()
+                except:
+                    pass
+
+            cls._sql_pool.clear()
+            cls._as400_pool.clear()
+            logger.info("🔒 Todas las conexiones del pool cerradas")
+
+# ═══════════════════════════ CONFIGURACIÓN DE TURNOS ═══════════════════════════
+
+# Variable global para configuración de turnos
+SHIFTS_CONFIG = {}
+
+def load_shifts_config() -> Dict[int, Dict]:
+    """Carga configuración de turnos desde la base de datos"""
+    conn = ConnectionPool.get_sql_connection()
+    if conn is None:
+        logger.warning("⚠️ No se pudo conectar para cargar turnos")
+        return {}
+
+    try:
+        cursor = conn.cursor()
+        sql = """
+        SELECT id, name, start_time, end_time 
+        FROM shifts 
+        ORDER BY start_time
+        """
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+
+        if not rows:
+            logger.error("❌ No se encontraron turnos activos en BD")
+            return {}
+
+        shifts = {}
+        for shift_id, name, start_time, end_time in rows:
+            # Convertir datetime.time de pyodbc a datetime.time de Python
+            if isinstance(start_time, str):
+                start_time = datetime.strptime(start_time, "%H:%M:%S").time()
+            if isinstance(end_time, str):
+                end_time = datetime.strptime(end_time, "%H:%M:%S").time()
+
+            shifts[shift_id] = {
+                'start': start_time,
+                'end': end_time,
+                'name': name
+            }
+
+        logger.info(f"✅ Turnos cargados: {len(shifts)} turnos")
+        for shift_id, data in shifts.items():
+            logger.info(f"   Turno {shift_id} ({data['name']}): {data['start'].strftime('%H:%M')} - {data['end'].strftime('%H:%M')}")
+
+        return shifts
+
+    except Exception as e:
+        logger.error(f"❌ Error cargando turnos: {e}")
+        logger.error(traceback.format_exc())
+        return {}
+    # NOTA: No cerramos la conexión aquí, el pool la maneja
+
+def refresh_shifts_config():
+    """Recarga la configuración de turnos y actualiza variable global"""
+    global SHIFTS_CONFIG
+    new_config = load_shifts_config()
+
+    if new_config:
+        SHIFTS_CONFIG = new_config
+        logger.info("🔄 Configuración de turnos actualizada desde BD")
+        return True
+    else:
+        logger.error("❌ No se pudo actualizar configuración de turnos")
+        return False
+
+def get_current_shift(current_time: time) -> Tuple[int, date]:
     """
-    Registra en CSV los números de parte que no pasan la validación.
-    Solo registra UNA VEZ por día (no se repite el mismo número en la misma fecha).
+    Determina el turno y fecha planificada basado en la hora actual.
 
     Args:
-        estacion: Nombre de la estación
-        numero_original: Número original del PLC
-        tipo_error: 'AS400_NO_ENCONTRADO', 'SQL_NO_ENCONTRADO', etc.
+        current_time: Hora actual
+
+    Returns:
+        Tuple[turno, fecha_plan]
+    """
+    from datetime import date, timedelta
+
+    if not SHIFTS_CONFIG:
+        # Si no hay configuración, usar valores por defecto
+        if time(8, 0) <= current_time < time(20, 0):
+            return 1, date.today()
+        else:
+            turno = 2
+            fecha_plan = date.today() if current_time >= time(20, 0) else date.today() - timedelta(days=1)
+            return turno, fecha_plan
+
+    # Ordenar turnos por hora de inicio
+    sorted_shifts = sorted(SHIFTS_CONFIG.items(), key=lambda x: x[1]['start'])
+
+    # Si tenemos 2 turnos (el común)
+    if len(sorted_shifts) == 2:
+        shift1_id, shift1_data = sorted_shifts[0]
+        shift2_id, shift2_data = sorted_shifts[1]
+
+        # Turno 1: desde su inicio hasta antes del turno 2
+        if shift1_data['start'] <= current_time < shift2_data['start']:
+            turno = shift1_id
+            fecha_plan = date.today()
+        # Turno 2: desde su inicio hasta antes del turno 1 del siguiente día
+        elif current_time >= shift2_data['start']:
+            turno = shift2_id
+            fecha_plan = date.today()
+        else:  # Horas antes del inicio del turno 1 (pertenece al turno 2 del día anterior)
+            turno = shift2_id
+            fecha_plan = date.today() - timedelta(days=1)
+
+    else:
+        # Lógica para múltiples turnos
+        for shift_id, shift_data in sorted_shifts:
+            if shift_data['start'] <= current_time:
+                turno = shift_id
+                fecha_plan = date.today()
+                break
+        else:
+            # Si no encontramos, usar el último turno del día anterior
+            turno = sorted_shifts[-1][0]
+            fecha_plan = date.today() - timedelta(days=1)
+
+    return turno, fecha_plan
+
+def has_shift_changed(previous_time: time, current_time: time) -> bool:
+    """
+    Verifica si hubo un cambio de turno entre dos horas.
+
+    Args:
+        previous_time: Hora anterior
+        current_time: Hora actual
+
+    Returns:
+        True si hubo cambio de turno
+    """
+    if not SHIFTS_CONFIG:
+        # Sin configuración, usar horarios por defecto
+        return (previous_time < time(8, 0) <= current_time) or (previous_time < time(20, 0) <= current_time)
+
+    # Verificar si cruzamos el inicio de algún turno
+    for shift_data in SHIFTS_CONFIG.values():
+        if previous_time < shift_data['start'] <= current_time:
+            return True
+
+    return False
+
+def safe_get_current_shift(current_time: time) -> Tuple[int, date]:
+    """
+    Versión segura que maneja cambios en configuración de turnos.
+
+    Args:
+        current_time: Hora actual
+
+    Returns:
+        Tuple[turno, fecha_plan]
+    """
+    try:
+        return get_current_shift(current_time)
+    except Exception as e:
+        logger.error(f"❌ Error calculando turno: {e}")
+        # Valores por defecto como fallback
+        if time(8, 0) <= current_time < time(20, 0):
+            return 1, date.today()
+        else:
+            return 2, date.today() if current_time >= time(20, 0) else date.today() - timedelta(days=1)
+
+def registrar_error_validacion(estacion, numero_original, tipo_error):
+    """
+    Registra e CSV los números de parte que no pasan la validación.
+    Solo registrna UNA VEZ por día (no se repite el mismo número en la misma fecha).
+    SIN TIMESTAMP - solo fecha.
     """
     try:
         ts = datetime.now()
-        fecha_hoy = ts.strftime('%Y-%m-%d')
+        fecha_hoy = ts.strftime('%Y-%m-%d')  # Solo fecha, sin hora
 
-        # Crear DataFrame con el nuevo registro
-        df_nuevo = pd.DataFrame([{
-            'estacion': estacion,
-            'numero_original_plc': numero_original,
-            'tipo_error': tipo_error,
-            'fecha': fecha_hoy,
-            'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S')
-        }])
+        #  LIMPIEZA EXHAUSTIVA
+        numero_original_limpio = str(numero_original)
+
+        # 1. NORMALIZAR ESPACIOS - esto es clave
+        numero_original_limpio = ' '.join(numero_original_limpio.split())
+
+        # 2. Limpiar caracteres problemáticos
+        numero_original_limpio = numero_original_limpio.replace(',', ';')
+        numero_original_limpio = numero_original_limpio.replace('\n', ' ')
+        numero_original_limpio = numero_original_limpio.replace('\r', ' ')
+        numero_original_limpio = numero_original_limpio.replace('\t', ' ')
+
+        # 3. Limitar y limpiar final
+        numero_original_limpio = numero_original_limpio[:100].strip()
+
+        # Limpiar estación
+        estacion_limpia = ' '.join(str(estacion).split()).strip()
+        tipo_error_limpio = ' '.join(str(tipo_error).split()).strip()
 
         file_exists = CSV_FILE.exists()
 
-        # 🔥 CAMBIO: Verificar si ya existe en la misma FECHA (día completo)
+        #  VERIFICACIÓN DE DUPLICADOS (SOLO estacion + numero + fecha)
         if file_exists:
             try:
-                existing_df = pd.read_csv(CSV_FILE)
+                # Leer CSV SIN TIMESTAMP
+                existing_df = pd.read_csv(
+                    CSV_FILE,
+                    encoding='utf-8',
+                    on_bad_lines='skip',
+                    engine='python'
+                )
 
-                # Buscar duplicados en la misma FECHA (sin importar la hora)
-                duplicates = existing_df[
-                    (existing_df['estacion'] == estacion) &
-                    (existing_df['numero_original_plc'] == numero_original) &
-                    (existing_df['tipo_error'] == tipo_error) &
-                    (existing_df['fecha'] == fecha_hoy)  # ← Solo compara la fecha (día)
-                ]
+                # Verificar columnas requeridas (sin timestamp)
+                required_columns = ['estacion', 'numero_original_plc', 'fecha']
+                if all(col in existing_df.columns for col in required_columns):
+                    #  LIMPIAR DATOS EXISTENTES
+                    existing_df['estacion'] = existing_df['estacion'].astype(str).apply(
+                        lambda x: ' '.join(str(x).split()).strip()
+                    )
+                    existing_df['numero_original_plc'] = existing_df['numero_original_plc'].astype(str).apply(
+                        lambda x: ' '.join(str(x).split()).replace(',', ';').strip()[:100]
+                    )
+                    existing_df['fecha'] = existing_df['fecha'].astype(str).str.strip()
 
-                if not duplicates.empty:
-                    # Ya existe un registro para este número de parte HOY
-                    logger.info(f"ℹ️ Error ya registrado hoy: {estacion} - {numero_original} - {tipo_error}")
-                    return
+                    #  BUSCAR DUPLICADOS EXACTOS
+                    estacion_buscar = estacion_limpia
+                    numero_buscar = numero_original_limpio
+
+                    # Buscar coincidencia exacta
+                    duplicado_mask = (
+                        (existing_df['estacion'] == estacion_buscar) &
+                        (existing_df['numero_original_plc'] == numero_buscar) &
+                        (existing_df['fecha'] == fecha_hoy)
+                    )
+
+                    duplicados = existing_df[duplicado_mask]
+
+                    if not duplicados.empty:
+                        logger.info(f"ℹ️ Ya registrado HOY: {estacion_buscar} - {numero_buscar}")
+                        return False
+
+                else:
+                    logger.warning(f"⚠️ CSV no tiene columnas necesarias")
+
             except Exception as e:
-                # Si hay error leyendo el CSV, continuar con el guardado
-                logger.warning(f"⚠️ Error verificando duplicados en CSV: {e}")
+                logger.warning(f"⚠️ Error verificando duplicados: {e}")
+                # Continuar para guardar
 
-        # Guardar nuevo registro
-        df_nuevo.to_csv(CSV_FILE, mode='a', header=not file_exists, index=False)
-        logger.info(f"📝 Error de validación registrado: {estacion} - {numero_original} - {tipo_error}")
+        #  CREAR NUEVO REGISTRO SIN TIMESTAMP
+        df_nuevo = pd.DataFrame([{
+            'estacion': estacion_limpia,
+            'numero_original_plc': numero_original_limpio,
+            'tipo_error': tipo_error_limpio,
+            'fecha': fecha_hoy
+            #  NO TIMESTAMP - completamente eliminado
+        }])
+
+        #  GUARDAR
+        try:
+            df_nuevo.to_csv(
+                CSV_FILE,
+                mode='a',
+                header=not file_exists,
+                index=False,
+                encoding='utf-8'
+            )
+            logger.info(f"📝 NUEVO registro: {estacion_limpia} - {numero_original_limpio}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error guardando CSV: {e}")
+            return False
 
     except Exception as e:
-        logger.error(f"❌ Error guardando CSV de validación: {e}")
+        logger.error(f"❌ Error en registrar_error_validacion: {e}")
+        return False
 
 # ═══════════════════════════ HELPERS LOGGING ═══════════════════════════
 
 def get_station_logger(estacion):
-    """Obtiene o crea un logger específico para una estación"""
+    """Obtiene o crea un logger específico para una estación con ROTACIÓN DE LOGS"""
     if estacion in station_loggers:
         return station_loggers[estacion]
 
     station_logger = logging.getLogger(f"station.{estacion}")
-    # 🔥 CAMBIO: Solo WARNING y ERROR
-    station_logger.setLevel(logging.WARNING)  # Solo WARNING, ERROR y CRITICAL
+    # CAMBIO: Solo WARNING y ERROR
+    station_logger.setLevel(logging.INFO)  # Solo WARNING, ERROR y CRITICAL
     station_logger.propagate = False
 
     log_path = LOGS_DIR / f"{estacion}.log"
-    file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
-    file_handler.setLevel(logging.WARNING)  # Solo WARNING y ERROR
+
+    # 🔄 CAMBIO: Usar RotatingFileHandler en lugar de FileHandler
+    # Tamaño máximo: 10 MB por archivo, mantener 5 archivos de backup
+    file_handler = RotatingFileHandler(
+        log_path,
+        mode='a',
+        encoding='utf-8',
+        maxBytes=100*1024*1024,  # 10 MB
+        backupCount=2           # mantener hasta 5 archivos de respaldo
+    )
+    file_handler.setLevel(logging.INFO)  # Solo WARNING y ERROR
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     station_logger.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)  # Solo WARNING y ERROR en consola
-    console_handler.setFormatter(formatter)
-    station_logger.addHandler(console_handler)
+    # ❌ REMOVER handler de consola para estaciones
+    # Las estaciones solo deben escribir en sus archivos de log
 
     station_loggers[estacion] = station_logger
     return station_logger
@@ -132,119 +585,166 @@ def get_station_logger(estacion):
 # ═══════════════════════════ CONEXIONES BD ═══════════════════════════
 
 def create_connection():
-    """Crea conexión a SQL Server usando variables del entorno"""
-    server = os.getenv('DB_SERVER')
-    database = os.getenv('DB_NAME')
-    username = os.getenv('DB_USER')
-    password = os.getenv('DB_PASSWORD')
-
-    return pyodbc.connect(
-        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
-        f'SERVER={server};'
-        f'DATABASE={database};'
-        f'UID={username};'
-        f'PWD={password}'
-    )
+    """Crea o reutiliza conexión a SQL Server usando pool"""
+    return ConnectionPool.get_sql_connection()
 
 def crear_conexion_as400(host: str = None, user: str = None,
                         password: str = None, database: str = "") -> Optional[pyodbc.Connection]:
-    """Crea conexión a AS400 usando variables del entorno"""
+    """Crea o reutiliza conexión a AS400 usando pool"""
+    return ConnectionPool.get_as400_connection()
 
-    host = host or os.getenv('AS400_HOST')
-    user = user or os.getenv('AS400_USER')
-    password = password or os.getenv('AS400_PASSWORD')
+# Cache para multiplicadores (evita consultas repetidas)
+_multiplicador_cache = {}
+_cache_lock = threading.RLock()
+_CACHE_TIMEOUT = 300  # 5 minutos
 
-    conn_str = f"DRIVER={{iSeries Access ODBC Driver}};SYSTEM={host};UID={user};PWD={password};"
-    if database:
-        conn_str += f"DBQ={database};"
-    try:
-        return pyodbc.connect(conn_str)
-    except pyodbc.Error:
-        return None
+def obtener_multiplicador_as400(numero_parte: str, estacion: str, estacion_logger=None) -> int:
+    """
+    Obtiene el multiplicador desde AS400 solo para el área de Estampado.
+    Para otras áreas, retorna 1 directamente.
+    CON CACHE para evitar consultas repetidas.
+    """
+    log = estacion_logger if estacion_logger else logger
+
+    # Verificar si la estación pertenece al área de Estampado
+    if estacion in system_monitor['estaciones']:
+        area = system_monitor['estaciones'][estacion].get('area', '').lower()
+
+        # Solo consultar AS400 si el área es 'estampado'
+        if 'estampado' not in area:
+            return 1
+    else:
+        return 1
+
+    # Verificar cache primero
+    cache_key = f"{numero_parte}_{estacion}"
+    current_time = datetime.now()
+
+    with _cache_lock:
+        if cache_key in _multiplicador_cache:
+            value, timestamp = _multiplicador_cache[cache_key]
+            # Verificar si el cache no ha expirado (5 minutos)
+            if (current_time - timestamp).total_seconds() < _CACHE_TIMEOUT:
+                log.debug(f"📦 Multiplicador desde cache: {value}")
+                return value
+
+        # No en cache o expirado, consultar AS400
+        conn_as400 = crear_conexion_as400()
+        if not conn_as400:
+            log.warning(f"No se pudo conectar a AS400 para {estacion}, usando multiplicador=1")
+            return 1
+
+        try:
+            cursor = conn_as400.cursor()
+            sql = "SELECT I.IUFD11 FROM LX834F01.IIU AS I WHERE RTRIM(I.IUPROD) = ? AND I.IUSEQN = 1"
+            cursor.execute(sql, (numero_parte,))
+            result = cursor.fetchone()
+
+            if result and result[0] is not None:
+                multiplicador = int(result[0])
+                # Guardar en cache
+                _multiplicador_cache[cache_key] = (multiplicador, current_time)
+                log.debug(f"✅ Multiplicador AS400 para {numero_parte}: {multiplicador}")
+                return multiplicador
+
+            log.debug(f"No se encontró multiplicador en AS400 para {numero_parte}, usando 1")
+            # Guardar 1 en cache también para no consultar repetidamente
+            _multiplicador_cache[cache_key] = (1, current_time)
+            return 1
+
+        except Exception as e:
+            log.error(f"Error consultando multiplicador en AS400: {e}")
+            return 1
 
 # ═══════════════════════════ FUNCIONES BASE DE DATOS (COMUNES) ═══════════════════════════
 
-def obtener_multiplicador_as400(numero_parte: str, estacion_logger=None) -> int:
-    log = estacion_logger if estacion_logger else logger
-    conn_as400 = crear_conexion_as400()
-    if not conn_as400:
-        return 1
-    try:
-        cursor = conn_as400.cursor()
-        sql = "SELECT I.IUFD11 FROM LX834F01.IIU AS I WHERE RTRIM(I.IUPROD) = ? AND I.IUSEQN = 2"
-        cursor.execute(sql, (numero_parte,))
-        result = cursor.fetchone()
-        if result and result[0] is not None:
-            return int(result[0])
-        return 1
-    except Exception as e:
-        log.error(f"Error AS400: {e}")
-        return 1
-    finally:
-        if conn_as400:
-            conn_as400.close()
-
 def load_config():
     """Carga configuración incluyendo el NOMBRE DEL ÁREA"""
-    sql = """
-    SELECT
-      wc.name          AS work_center_name,
-      wc.ip            AS work_center_ip,
-      tt.name          AS tag_type_name,
-      t.address        AS tag_address,
-      t.long           AS tag_long,
-      a.name           AS area_name
-    FROM work_centers wc
-    JOIN tags t        ON wc.id = t.work_center_id
-    JOIN tag_types tt  ON t.tag_type_id = tt.id
-    LEFT JOIN lines l  ON wc.line_id = l.id
-    LEFT JOIN areas a  ON l.area_id = a.id
-    """
     conn = create_connection()
-    cursor = conn.cursor()
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    conn.close()
+    if conn is None:
+        logger.warning("⚠️ No se pudo establecer conexión para cargar configuración")
+        return {}
 
-    ip_groups = defaultdict(lambda: {
-        'estaciones': [], 'port': 1025, 'serie': 'Q',
-        'all_addresses': set(), 'station_configs': {}, 'area': 'Default'
-    })
+    try:
+        sql = """
+        SELECT
+          wc.name          AS work_center_name,
+          wc.ip            AS work_center_ip,
+          tt.name          AS tag_type_name,
+          t.address        AS tag_address,
+          t.long           AS tag_long,
+          a.name           AS area_name
+        FROM work_centers wc
+        JOIN tags t        ON wc.id = t.work_center_id
+        JOIN tag_types tt  ON t.tag_type_id = tt.id
+        LEFT JOIN lines l  ON wc.line_id = l.id
+        LEFT JOIN areas a  ON l.area_id = a.id
+        """
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
 
-    global system_monitor
+        if not rows:
+            logger.warning("⚠️ No se encontraron configuraciones en la base de datos")
+            return {}
 
-    for wc, ip, tag, addr, lng, area in rows:
-        if area:
-            ip_groups[ip]['area'] = area
+        ip_groups = defaultdict(lambda: {
+            'estaciones': [], 'port': 1025, 'serie': 'Q',
+            'all_addresses': set(), 'station_configs': {}, 'area': 'Default'
+        })
 
-        if wc not in system_monitor['estaciones']:
-            system_monitor['estaciones'][wc] = {}
+        global system_monitor
 
-        system_monitor['estaciones'][wc]['area'] = area or 'N/A'
-        if 'ip' not in system_monitor['estaciones'][wc]:
-             system_monitor['estaciones'][wc]['ip'] = ip
+        for wc, ip, tag, addr, lng, area in rows:
+            if area:
+                ip_groups[ip]['area'] = area
 
-        tag_lower = tag.lower()
-        if tag_lower == "puerto":
-            ip_groups[ip]['port'] = int(addr)
-        elif tag_lower == "serie plc":
-            ip_groups[ip]['serie'] = addr
-        else:
-            if wc not in ip_groups[ip]['station_configs']:
-                ip_groups[ip]['station_configs'][wc] = {}
+            if wc not in system_monitor['estaciones']:
+                system_monitor['estaciones'][wc] = {}
 
-            ip_groups[ip]['station_configs'][wc][tag] = {
-                "address": addr,
-                "long": int(lng)
-            }
-            ip_groups[ip]['all_addresses'].update(expand_block(addr, int(lng)))
+            system_monitor['estaciones'][wc]['area'] = area or 'N/A'
+            if 'ip' not in system_monitor['estaciones'][wc]:
+                 system_monitor['estaciones'][wc]['ip'] = ip
 
-        if wc not in ip_groups[ip]['estaciones']:
-            ip_groups[ip]['estaciones'].append(wc)
+            tag_lower = tag.lower()
+            if tag_lower == "puerto":
+                ip_groups[ip]['port'] = int(addr)
+            elif tag_lower == "serie plc":
+                ip_groups[ip]['serie'] = addr
+            else:
+                if wc not in ip_groups[ip]['station_configs']:
+                    ip_groups[ip]['station_configs'][wc] = {}
 
-    return dict(ip_groups)
+                ip_groups[ip]['station_configs'][wc][tag] = {
+                    "address": addr,
+                    "long": int(lng)
+                }
+                ip_groups[ip]['all_addresses'].update(expand_block(addr, int(lng)))
 
-def actualizar_registro(cursor, contador, fecha_fmt, record_id, status, log, start_fmt=None):
+            if wc not in ip_groups[ip]['estaciones']:
+                ip_groups[ip]['estaciones'].append(wc)
+
+        # 🔄 Solo mostrar log si hay cambios significativos en la configuración
+        config_hash = hashlib.md5(str(sorted(ip_groups.items())).encode()).hexdigest()
+
+        if not hasattr(load_config, 'last_config_hash'):
+            load_config.last_config_hash = None
+
+        if config_hash != load_config.last_config_hash:
+            logger.info(f"📋 Configuración cargada: {len(ip_groups)} IPs, {len(system_monitor['estaciones'])} estaciones")
+            if load_config.last_config_hash:
+                logger.info("🔄 Configuración actualizada desde BD")
+            load_config.last_config_hash = config_hash
+
+        return dict(ip_groups)
+
+    except Exception as e:
+        logger.error(f"❌ Error cargando configuración: {e}")
+        logger.error(traceback.format_exc())
+        return {}
+    # NOTA: No cerramos la conexión aquí, el pool la maneja
+
+def actualizar_registro(cursor, contador, fecha_fmt, record_id, status, log, start_fmt=None, necesita_start=False):
     """
     Actualiza el registro de producción.
     """
@@ -254,6 +754,9 @@ def actualizar_registro(cursor, contador, fecha_fmt, record_id, status, log, sta
     if start_fmt:
         sql_parts.insert(0, "production_start=?")
         params.insert(0, start_fmt)
+    elif necesita_start:
+        sql_parts.insert(0, "production_start=?")
+        params.insert(0, fecha_fmt)
 
     sql = "UPDATE production_records SET " + ", ".join(sql_parts) + " WHERE id=?"
     params.append(record_id)
@@ -265,47 +768,77 @@ def obtener_id_registro_activo(cursor, estacion, fecha_ajustada, turno, numero_p
              FROM production_records pr
              JOIN part_numbers pn ON pr.part_number_id = pn.id
              JOIN work_centers wc ON pn.work_center_id = wc.id
-             WHERE wc.name=? AND pn.number=? AND pr.planned_date=? AND pr.shift_id=? AND pr.status_id IN (3, 7, 8) AND pr.synced_to_infor != 1
+             WHERE wc.name=? AND REPLACE(pn.number, ' ', '')=? AND pr.planned_date=? AND pr.shift_id=? AND pr.status_id IN (3, 7, 8) AND pr.synced_to_infor != 1
              ORDER BY pr.status_id DESC, pr.id DESC'''
     cursor.execute(sql, (estacion, numero_parte, fecha_ajustada, turno))
     res = cursor.fetchone()
     if res:
-        mult = obtener_multiplicador_as400(numero_parte, log)
+        mult = obtener_multiplicador_as400(numero_parte, estacion, log)
         return res[0], res[1], res[2], res[3], res[4], mult
     return None, None, None, None, None, None
 
 def crear_nuevo_registro(cursor, numero_parte, estacion, contador, turno, fecha_fmt, fecha_ajustada, num_orig, log):
+    #  NUEVO: Verificación previa para diagnóstico
+    try:
+        sql_check = """
+            SELECT pn.id, pn.number, wc.name, pn.is_obsolete
+            FROM part_numbers pn
+            JOIN work_centers wc ON pn.work_center_id = wc.id
+            WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=?
+        """
+        cursor.execute(sql_check, (numero_parte, estacion))
+        check_result = cursor.fetchone()
+
+        if check_result:
+            log.info(f"✅ Número de parte encontrado en BD: ID={check_result[0]}, number={check_result[1]}, estacion={check_result[2]}, obsolete={check_result[3]}")
+            if check_result[3] == 1:
+                log.warning(f"⚠️ El número de parte {numero_parte} está marcado como OBSOLETO")
+                registrar_error_validacion(estacion, num_orig, "PART_NUMBER_OBSOLETO")
+                return None, None, None, None
+        else:
+            log.warning(f"⚠️ Número de parte {numero_parte} NO existe en part_numbers para estación {estacion}")
+            log.warning(f"   Intentando buscar sin remover espacios...")
+            # Intentar sin remover espacios
+            cursor.execute("SELECT pn.number FROM part_numbers pn JOIN work_centers wc ON pn.work_center_id = wc.id WHERE pn.number=? AND wc.name=?", (numero_parte, estacion))
+            alt_result = cursor.fetchone()
+            if alt_result:
+                log.info(f"   Encontrado con espacios: {alt_result[0]}")
+            else:
+                log.warning(f"   Tampoco encontrado con espacios originales")
+                registrar_error_validacion(estacion, num_orig, "PART_NUMBER_NO_EXISTE_BD")
+                return None, None, None, None
+    except Exception as e:
+        log.error(f"Error en verificación previa: {e}")
+
     sql = '''INSERT INTO production_records (part_number_id, produced_quantity, shift_id, production_start, status_id, planned_date)
              OUTPUT INSERTED.id, INSERTED.planned_quantity, INSERTED.produced_quantity
              SELECT pn.id, ?, ?, ?, 3, ? FROM part_numbers pn
              JOIN work_centers wc ON pn.work_center_id = wc.id
-             WHERE pn.number=? AND wc.name=? AND pn.is_obsolete=0'''
+             WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=? AND pn.is_obsolete=0'''
+
     try:
+        #  NUEVO: Logging detallado antes del insert
+        log.info(f"🔍 Intentando crear registro para: numero_parte={numero_parte}, estacion={estacion}, turno={turno}")
+
         cursor.execute(sql, (contador, turno, fecha_fmt, fecha_ajustada, numero_parte, estacion))
         res = cursor.fetchone()
         if res:
-            mult = obtener_multiplicador_as400(numero_parte, log)
+            mult = obtener_multiplicador_as400(numero_parte, estacion, log)
+            log.info(f"✅ Registro creado exitosamente: ID={res[0]}, numero_parte={numero_parte}")
             return res[0], res[1], res[2], mult
         else:
-            log.warning(f"No se pudo crear registro para {numero_parte}")
-            try:
-                ts = datetime.now()
-                df = pd.DataFrame([{
-                    'estacion': estacion, 'numero_parte': numero_parte,
-                    'numero_parte_original': num_orig, 'fecha': ts.strftime('%Y-%m-%d'),
-                    'timestamp': ts.strftime('%Y-%m-%d %H:%M:%S')
-                }])
-                hdr = not CSV_FILE.exists()
-                df.to_csv(CSV_FILE, mode='a', header=hdr, index=False)
-            except Exception as e:
-                log.error(f"Error CSV: {e}")
+            log.warning(f"⚠️ No se pudo crear registro para {numero_parte} - La consulta no retornó resultados")
+            log.warning(f"   Esto significa que el número de parte no existe en part_numbers o no está asociado a {estacion}")
+            #  MODIFICADO: Ahora usa la función registrar_error_validacion en lugar de escribir directo
+            registrar_error_validacion(estacion, num_orig, "SQL_NO_ENCONTRADO")
             return None, None, None, None
     except Exception as e:
-        log.error(f"Error crear registro: {e}")
+        log.error(f"❌ Error crear registro para {numero_parte}: {e}")
+        log.error(f"   Parámetros: contador={contador}, turno={turno}, estacion={estacion}")
         return None, None, None, None
 
 def obtener_part_number_id(cursor, numero_parte, estacion):
-    sql = "SELECT pn.id FROM part_numbers pn JOIN work_centers wc ON pn.work_center_id = wc.id WHERE pn.number=? AND wc.name=?"
+    sql = "SELECT pn.id FROM part_numbers pn JOIN work_centers wc ON pn.work_center_id = wc.id WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=?"
     cursor.execute(sql, (numero_parte, estacion))
     res = cursor.fetchone()
     return res[0] if res else None
@@ -348,17 +881,10 @@ def expand_block(address: str, length: int) -> list[str]:
     else:
         return [f"{address}{i}" for i in range(length)]
 
-def decodificar_bloque(bloque, estacion=None, area=None):
+def decodificar_bloque(bloque):
     """
     Decodifica el bloque del PLC.
-    SOLO si el área es 'Estampado' realiza la validación cruzada (AS400 + SQL).
-    Para cualquier otra área, devuelve el valor limpio directo.
-
-    Returns:
-        tuple: (original, partes_validadas, metadata)
-        - original: String crudo del PLC
-        - partes_validadas: Lista de números validados
-        - metadata: Dict con info de validación {'error': str, 'candidatos_as400': list}
+    Devuelve directamente el número limpio.
     """
     if not bloque:
         return None, None, {}
@@ -370,66 +896,144 @@ def decodificar_bloque(bloque, estacion=None, area=None):
     if not limpia:
         return original, [], {}
 
-    if not area or "estampado" not in str(area).lower():
-        return original, [limpia], {}
+    return original, [limpia], {}
 
-    if not estacion:
-        return original, [limpia], {}
+# ═══════════════════════════ 🆕 NUEVA FUNCIÓN: VALIDACIÓN ESTAMPADO ═══════════════════════════
 
-    candidatos = []
-    partes_finales = []
-    metadata = {'error': None, 'candidatos_as400': []}
+# Cache global para almacenar números de parte validados por MDI y estación
+# Estructura: {(estacion, mdi): [lista_de_numeros_parte_validados]}
+validacion_estampado_cache = {}
+
+def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> list:
+    """
+    Valida números de parte para el área de ESTAMPADO.
+
+    Args:
+        mdi: Número MDI (receta del troquel) que viene del PLC
+        estacion: Nombre de la estación
+        log: Logger para la estación
+
+    Returns:
+        Lista de números de parte válidos para la estación
+    """
+    # Crear clave de cache
+    cache_key = (estacion, mdi)
+
+    # Si ya tenemos el resultado en cache, retornarlo
+    if cache_key in validacion_estampado_cache:
+        log.info(f"✅ Usando cache para MDI={mdi} en {estacion}")
+        return validacion_estampado_cache[cache_key]
+
+    log.info(f"🔍 Validando números de parte para MDI={mdi} en {estacion}")
+
+    # Conectar a AS400 para obtener los números de parte posibles
+    conn_as400 = crear_conexion_as400()
+    if not conn_as400:
+        log.error(f"❌ No se pudo conectar a AS400 para validar MDI={mdi}")
+        return []
+
+    numeros_parte_posibles = []
 
     try:
-        conn_as400 = crear_conexion_as400()
-        if conn_as400:
-            try:
-                cursor_as400 = conn_as400.cursor()
-                sql_as400 = "SELECT TRIM(IUPROD) FROM LX834F01.IIU WHERE TRIM(IUFD05) = ? AND IUSEQN = 2"
-                cursor_as400.execute(sql_as400, (limpia,))
-                candidatos = [row[0].strip() for row in cursor_as400.fetchall() if row[0]]
-                metadata['candidatos_as400'] = candidatos
-            except Exception as e:
-                print(f"Error AS400: {e}")
-                metadata['error'] = f"AS400_ERROR: {str(e)}"
-            finally:
-                if conn_as400:
-                    conn_as400.close()
+        cursor_as400 = conn_as400.cursor()
+        # Consulta AS400 para obtener números de parte según el MDI
+        sql_as400 = "SELECT REPLACE(IUPROD, ' ', '') FROM LX834F01.IIU WHERE REPLACE(IUFD05, ' ', '') = ? AND IUSEQN = 2"
 
-        if not candidatos:
-            metadata['error'] = "AS400_NO_ENCONTRADO"
-            registrar_error_validacion(estacion, original, "AS400_NO_ENCONTRADO")
-            return original, [], metadata
+        #  DEBUG: Mostrar consulta
+        mdi_sin_espacios = mdi.replace(' ', '')
+        log.info(f"   🔎 Consultando AS400 con MDI (sin espacios): '{mdi_sin_espacios}'")
 
-        conn_sql = create_connection()
-        if conn_sql:
-            try:
-                cursor_sql = conn_sql.cursor()
-                placeholders = ', '.join(['?'] * len(candidatos))
-                sql_check = f"""
-                    SELECT pn.number FROM part_numbers pn 
-                    JOIN work_centers wc ON pn.work_center_id = wc.id 
-                    WHERE wc.name = ? AND pn.number IN ({placeholders})
-                """
-                params = [estacion] + candidatos
-                cursor_sql.execute(sql_check, params)
-                partes_finales = [row[0] for row in cursor_sql.fetchall()]
-            except Exception as e:
-                print(f"Error SQL Local: {e}")
-                metadata['error'] = f"SQL_ERROR: {str(e)}"
-            finally:
-                if conn_sql:
-                    conn_sql.close()
+        cursor_as400.execute(sql_as400, (mdi_sin_espacios,))
 
-        if not partes_finales:
-            metadata['error'] = "SQL_NO_ENCONTRADO"
-            registrar_error_validacion(estacion, original, "SQL_NO_ENCONTRADO")
+        rows = cursor_as400.fetchall()
+        numeros_parte_posibles = [row[0] for row in rows if row[0]]
+
+        log.info(f"📋 AS400 retornó {len(numeros_parte_posibles)} números de parte para MDI={mdi}")
+
+        #  DEBUG: Mostrar números encontrados
+        if numeros_parte_posibles:
+            log.info(f"   Números encontrados en AS400: {numeros_parte_posibles}")
 
     except Exception as e:
-        print(f"Error validación estampado: {e}")
-        metadata['error'] = f"VALIDATION_ERROR: {str(e)}"
+        log.error(f"❌ Error consultando AS400 para MDI={mdi}: {e}")
+        return []
+    finally:
+        # NOTA: No cerramos la conexión aquí, el pool la maneja
+        pass
 
-    return original, partes_finales, metadata
+    # Si no hay números de parte posibles, registrar error y retornar lista vacía
+    if not numeros_parte_posibles:
+        log.warning(f"⚠️ No se encontraron números de parte para MDI={mdi}")
+        #  NUEVO: Registrar en CSV cuando no se encuentran números en AS400
+        registrar_error_validacion(estacion, mdi, "MDI_NO_ENCONTRADO_AS400")
+        validacion_estampado_cache[cache_key] = []
+        return []
+
+    # Ahora validar contra SQL Server para filtrar por estación
+    conn_sql = create_connection()
+    if not conn_sql:
+        log.error(f"❌ No se pudo conectar a SQL Server para validar MDI={mdi}")
+        return []
+
+    numeros_parte_validados = []
+
+    try:
+        cursor_sql = conn_sql.cursor()
+
+        # Crear placeholders para la consulta IN
+        placeholders = ','.join(['?' for _ in numeros_parte_posibles])
+
+        #  CORRECCIÓN: Limpiar espacios de los números de AS400 antes de comparar
+        numeros_sin_espacios = [num.replace(' ', '') for num in numeros_parte_posibles]
+
+        #  LOGGING: Mostrar números que se van a buscar
+        log.info(f"🔍 Buscando en SQL Server los siguientes números (sin espacios): {numeros_sin_espacios}")
+
+        sql_check = f"""
+            SELECT REPLACE(pn.number, ' ', '') FROM part_numbers pn
+            JOIN work_centers wc ON pn.work_center_id = wc.id
+            WHERE wc.name = ? AND REPLACE(pn.number, ' ', '') IN ({placeholders})
+        """
+
+        # Ejecutar consulta con números sin espacios
+        params = [estacion] + numeros_sin_espacios
+        cursor_sql.execute(sql_check, params)
+
+        rows = cursor_sql.fetchall()
+        numeros_parte_validados = [row[0] for row in rows if row[0]]
+
+        log.info(f"✅ SQL Server validó {len(numeros_parte_validados)} números de parte para estación {estacion}")
+
+        #  LOGGING: Mostrar qué números se encontraron
+        if numeros_parte_validados:
+            log.info(f"   Números encontrados: {numeros_parte_validados}")
+        else:
+            log.warning(f"   Números buscados: {numeros_sin_espacios}")
+            log.warning(f"   Números encontrados: NINGUNO")
+
+        #  NUEVO: Si AS400 tenía números pero SQL Server no encontró ninguno válido para esta estación
+        if not numeros_parte_validados:
+            log.warning(f"⚠️ AS400 retornó {len(numeros_parte_posibles)} números pero ninguno válido para estación {estacion}")
+            # Registrar todos los números que AS400 retornó pero que no están en SQL Server
+            numeros_str = ", ".join(numeros_parte_posibles[:5])  # Primeros 5
+            if len(numeros_parte_posibles) > 5:
+                numeros_str += f" (y {len(numeros_parte_posibles)-5} más)"
+
+            #  IMPORTANTE: Registrar en CSV ANTES de retornar
+            log.info(f"📝 Registrando en CSV: MDI={mdi}, números={numeros_str}")
+            registrar_error_validacion(estacion, f"MDI={mdi}: {numeros_str}", "NUMEROS_NO_VALIDOS_ESTACION")
+
+    except Exception as e:
+        log.error(f"❌ Error validando en SQL Server para MDI={mdi}: {e}")
+        return []
+    finally:
+        # NOTA: No cerramos la conexión aquí, el pool la maneja
+        pass
+
+    # Guardar en cache
+    validacion_estampado_cache[cache_key] = numeros_parte_validados
+
+    return numeros_parte_validados
 
 # ═══════════════════════════ PATRONES STRATEGY & FACTORY ═══════════════════════════
 
@@ -491,7 +1095,7 @@ class IPDataCollector:
         grupo = "GLOBAL"
         if len(parts) > 1:
             possible_suffix = parts[-1].upper()
-            if possible_suffix in ['LH', 'RH']:
+            if possible_suffix in ['LH', 'RH', 'LH REAR', 'RH REAR']:
                 grupo = possible_suffix
 
         tipo = "otro"
@@ -502,11 +1106,118 @@ class IPDataCollector:
 
         return tipo, grupo
 
-    async def collect_and_enqueue(self, plc, group_info):
-        try:
-            addrs = list(group_info['all_addresses'])
-            if not addrs: return
+    def _process_station_data(self, estacion, cfg, val_map, timestamp):
+        """Procesa datos de una estación específica"""
+        from collections import defaultdict
 
+        groups_data = defaultdict(dict)
+
+        for tag_name, info in cfg.items():
+            tipo, grupo = self._parse_tag(tag_name)
+            block_vals = [val_map.get(a, 0) for a in expand_block(info['address'], info['long'])]
+
+            val = None
+            if tipo == "contador":
+                val = block_vals[0] if block_vals else 0
+            elif tipo == "tiempo":
+                try:
+                    val = abs(int(block_vals[0])/1000.0)
+                except:
+                    val = 0.0
+            elif tipo == "parte":
+                #  SIMPLIFICADO: Decodificar
+                orig, limpios, meta = decodificar_bloque(block_vals)
+                val = {'orig': orig, 'list': limpios, 'meta': meta}
+            elif tipo == "troquel":
+                val = block_vals[0] if block_vals else 0
+
+            if val is not None:
+                groups_data[grupo][tipo] = val
+
+        # 🆕 NUEVO: Obtener el logger de la estación para usar en validación
+        log = get_station_logger(estacion)
+
+        datos_estacion = []
+        for grp, data in groups_data.items():
+            if 'contador' not in data:
+                continue
+
+            partes = data.get('parte', {'orig': '', 'list': [], 'meta': {}})
+            troquel_id = data.get('troquel', None)
+
+            # 🆕 NUEVO: Si es área de ESTAMPADO y tenemos un número original (MDI)
+            if "estampado" in str(self.area).lower() and partes['orig'] and partes['orig'].strip():
+                mdi = partes['orig'].strip()
+
+                # Validar números de parte usando la nueva función
+                numeros_validados = validar_numeros_parte_estampado(mdi, estacion, log)
+
+                #  NUEVO: Logging detallado de lo que se encontró
+                log.info(f"📦 Procesando estampado: MDI={mdi}, estacion={estacion}")
+                log.info(f"   Números validados: {numeros_validados}")
+                log.info(f"   Contador actual: {data['contador']}, Troquel: {troquel_id}")
+
+                if numeros_validados:
+                    # Agregar cada número de parte validado con su contador
+                    for num_parte in numeros_validados:
+                        datos_estacion.append({
+                            'parte': num_parte,
+                            'original': partes['orig'],
+                            'contador': data['contador'],
+                            'tiempo': data.get('tiempo', 0.0),
+                            'troquel_id': troquel_id,
+                            'validado': True
+                        })
+                    log.info(f"✅ Agregados {len(numeros_validados)} números de parte validados a datos_estacion")
+                else:
+                    # No se encontraron números de parte válidos
+                    log.warning(f"❌ No se encontraron números válidos para MDI={mdi}")
+                    log.warning(f"   Se agregará como NO VALIDADO para que aparezca en la interfaz")
+
+                    #  IMPORTANTE: Registrar en CSV cuando no hay números validados
+                    # Esto es adicional al registro que ya se hace en validar_numeros_parte_estampado
+                    registrar_error_validacion(estacion, partes['orig'], "NO_PART_NUMBER_ESTAMPADO")
+
+                    datos_estacion.append({
+                        'parte': None,
+                        'original': partes['orig'],
+                        'contador': data['contador'],
+                        'tiempo': data.get('tiempo', 0.0),
+                        'troquel_id': troquel_id,
+                        'validado': False,
+                        'error_validacion': 'NO_PART_NUMBER_ESTAMPADO'
+                    })
+            else:
+                # Para otras áreas, mantener el comportamiento original
+                if partes['list']:
+                    for p_nombre in partes['list']:
+                        if not p_nombre:
+                            continue
+                        datos_estacion.append({
+                            'parte': p_nombre,
+                            'original': partes['orig'],
+                            'contador': data['contador'],
+                            'tiempo': data.get('tiempo', 0.0),
+                            'troquel_id': troquel_id,
+                            'validado': True
+                        })
+                elif partes['orig'] and partes['orig'].strip():
+                    datos_estacion.append({
+                        'parte': None,
+                        'original': partes['orig'],
+                        'contador': data['contador'],
+                        'tiempo': data.get('tiempo', 0.0),
+                        'troquel_id': troquel_id,
+                        'validado': False,
+                        'error_validacion': 'NO_PART_NUMBER'
+                    })
+
+        return datos_estacion
+
+    async def collect_and_enqueue(self, plc, group_info, addrs):
+        """Método optimizado para lectura PLC"""
+        try:
+            # Leer datos del PLC
             vals, _ = plc.randomread(word_devices=addrs, dword_devices=[])
             val_map = dict(zip(addrs, vals))
 
@@ -515,52 +1226,7 @@ class IPDataCollector:
 
             for est in self.estaciones:
                 cfg = group_info['station_configs'].get(est, {})
-                groups_data = defaultdict(dict)
-
-                for tag_name, info in cfg.items():
-                    tipo, grupo = self._parse_tag(tag_name)
-                    block_vals = [val_map.get(a, 0) for a in expand_block(info['address'], info['long'])]
-
-                    val = None
-                    if tipo == "contador": val = block_vals[0] if block_vals else 0
-                    elif tipo == "tiempo":
-                        try: val = abs(int(block_vals[0])/1000.0)
-                        except: val = 0.0
-                    elif tipo == "parte":
-                        orig, limpios, meta = decodificar_bloque(block_vals, estacion=est, area=self.area)
-                        val = {'orig': orig, 'list': limpios, 'meta': meta}
-                    elif tipo == "troquel": val = block_vals[0] if block_vals else 0
-
-                    if val is not None: groups_data[grupo][tipo] = val
-
-                datos_estacion = []
-                for grp, data in groups_data.items():
-                    if 'contador' not in data: continue
-
-                    partes = data.get('parte', {'orig': '', 'list': [], 'meta': {}})
-                    troquel_id = data.get('troquel', None)
-
-                    if partes['list']:
-                        for p_nombre in partes['list']:
-                            if not p_nombre: continue
-                            datos_estacion.append({
-                                'parte': p_nombre,
-                                'original': partes['orig'],
-                                'contador': data['contador'],
-                                'tiempo': data.get('tiempo', 0.0),
-                                'troquel_id': troquel_id,
-                                'validado': True
-                            })
-                    elif partes['orig'] and partes['orig'].strip():
-                        datos_estacion.append({
-                            'parte': None,
-                            'original': partes['orig'],
-                            'contador': data['contador'],
-                            'tiempo': data.get('tiempo', 0.0),
-                            'troquel_id': troquel_id,
-                            'validado': False,
-                            'error_validacion': partes['meta'].get('error', 'UNKNOWN')
-                        })
+                datos_estacion = self._process_station_data(est, cfg, val_map, now)
 
                 if datos_estacion:
                     batch.append({
@@ -570,6 +1236,7 @@ class IPDataCollector:
                         'area': self.area,
                         'plc_ok': True
                     })
+
 
                     last = datos_estacion[0]
                     if est in system_monitor['estaciones']:
@@ -592,25 +1259,18 @@ class IPDataCollector:
                         'plc_ok': True
                     })
 
-                    if est in system_monitor['estaciones']:
-                        system_monitor['estaciones'][est].update({
-                            'parte_actual': '--',
-                            'contador': 0,
-                            'tiempo_ciclo': 0.0,
-                            'ultima_actualizacion': now,
-                            'validado': True,
-                            'error_validacion': None
-                        })
-
+            #  Enviar batch a la cola
             if batch and self.ip in ip_data_queues:
-                try: ip_data_queues[self.ip].put_nowait(batch)
-                except asyncio.QueueFull: pass
+                try:
+                    ip_data_queues[self.ip].put_nowait(batch)
+                except asyncio.QueueFull:
+                    logger.warning(f"Cola llena para {self.ip}, descartando batch")
 
                 if self.ip in system_monitor['ips']:
                     system_monitor['ips'][self.ip].update({'conectado': True, 'ultima_lectura': now})
 
         except Exception as e:
-            system_monitor['estadisticas']['errores_conexion'] += 1
+            logger.error(f"Error en collect_and_enqueue para {self.ip}: {str(e)[:100]}")
             raise
 
 # ═══════════════════════════ PROCESADOR (CONSUMIDOR) ═══════════════════════════
@@ -636,6 +1296,13 @@ class IPDataProcessor:
                     h_str = record.get('hora_cambio', '00:00:00')
                     h_obj = datetime.strptime(h_str, "%H:%M:%S").time()
                     record['hora_cambio'] = h_obj
+
+                    #  RESTAURAR número original desde el estado
+                    if 'numero_original' not in record:
+                        # Intentar inferir del número validado (para compatibilidad)
+                        validated_part = clave.split('_', 1)[1] if '_' in clave else ''
+                        record['numero_original'] = validated_part
+
                     self.active_records[clave] = record
                 except Exception as e:
                     logger.error(f"Error al deserializar registro {clave}: {e}")
@@ -653,7 +1320,8 @@ class IPDataProcessor:
                 rec_copy = record.copy()
                 if isinstance(rec_copy.get('hora_cambio'), time):
                     rec_copy['hora_cambio'] = rec_copy['hora_cambio'].strftime("%H:%M:%S")
-                if rec_copy.get('id_registro') is None: rec_copy['id_registro'] = 0
+                if rec_copy.get('id_registro') is None:
+                    rec_copy['id_registro'] = 0
                 serializable_data[clave] = rec_copy
 
             with open(self.state_file, 'w') as f:
@@ -665,10 +1333,22 @@ class IPDataProcessor:
         if self.ip not in ip_data_queues: return
         while True:
             try:
+                #  MODIFICACIÓN: Procesar todo el batch de una vez
                 batch = await ip_data_queues[self.ip].get()
-                for pkg in batch:
-                    await self._process_estacion(pkg)
+
+                #  NUEVO: Procesar todas las estaciones del batch concurrentemente
+                # pero con un semáforo para no saturar la BD
+                semaphore = asyncio.Semaphore(10)  # Máximo 10 estaciones simultáneas
+
+                async def process_with_semaphore(pkg):
+                    async with semaphore:
+                        await self._process_estacion(pkg)
+
+                tasks = [process_with_semaphore(pkg) for pkg in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
                 ip_data_queues[self.ip].task_done()
+
             except Exception as e:
                 logger.error(f"Error en loop de procesamiento para {self.ip}: {e}")
                 await asyncio.sleep(0.5)
@@ -681,7 +1361,13 @@ class IPDataProcessor:
         now = pkg['ts']
 
         log = get_station_logger(estacion)
+
+        # ✅ Usar pool de conexiones
         conn = create_connection()
+        if conn is None:
+            log.error("❌ No se pudo obtener conexión a BD para procesar estación")
+            return
+
         db_strategy = DBStrategyFactory.get_strategy(area, log)
 
         state_changed = False
@@ -690,15 +1376,12 @@ class IPDataProcessor:
             with conn.cursor() as cursor:
                 hora = now.time().replace(microsecond=0)
 
-                if time(8,0) <= hora < time(20,0):
-                    turno = 1
-                    fecha_plan = now.date()
-                elif hora >= time(20,0):
-                    turno = 2
-                    fecha_plan = now.date()
-                else:
-                    turno = 2
-                    fecha_plan = now.date() - timedelta(days=1)
+                # Usar versión segura para obtener turno
+                turno, fecha_plan = safe_get_current_shift(hora)
+
+                # Registrar para diagnóstico (opcional)
+                if not SHIFTS_CONFIG:
+                    log.warning(f"⚠️ Usando valores por defecto para turnos en {estacion}")
 
                 fecha_fmt = now.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -726,7 +1409,8 @@ class IPDataProcessor:
 
                 claves_actuales_en_plc = set()
                 for d in datos:
-                    claves_actuales_en_plc.add(f"{estacion}_{d['parte']}")
+                    if d['parte']:  # Solo agregar si tiene parte válida
+                        claves_actuales_en_plc.add(f"{estacion}_{d['parte']}")
 
                 claves_obsoletas = []
                 for k in self.active_records:
@@ -736,12 +1420,12 @@ class IPDataProcessor:
                 for k in claves_obsoletas:
                     record_id = self.active_records[k].get('id_registro')
                     if record_id:
-                        try:
+                         try:
                             cursor.execute(
                                 "UPDATE production_records SET status_id = 8, production_end=? WHERE id=? AND status_id=7",
                                 (fecha_fmt, record_id)
                             )
-                        except Exception as e:
+                         except Exception as e:
                             log.error(f"Error cerrando registro obsoleto {record_id}: {e}")
 
                     del self.active_records[k]
@@ -758,6 +1442,12 @@ class IPDataProcessor:
 
                     if not validado:
                         log.warning(f"⚠️ Número de parte NO VALIDADO: {num_orig} - Error: {error_val}")
+
+                        #  CRÍTICO: Registrar en CSV ANTES de hacer continue
+                        if error_val:
+                            log.info(f"📝 Registrando error en CSV: estacion={estacion}, num_orig={num_orig}, error={error_val}")
+                            registrar_error_validacion(estacion, num_orig, error_val)
+
                         continue
 
                     clave = f"{estacion}_{num}"
@@ -768,27 +1458,61 @@ class IPDataProcessor:
                         )
 
                         corrida_previa = 0
-                        if id_reg and status == 8:
-                            corrida_previa = q_prod or 0
-                            q_prod = 0
+                        necesita_production_start = False
 
-                        if id_reg is None or status == 8:
+                        # CASO 1: No hay registro en BD → CREAR NUEVO
+                        if id_reg is None:
                             id_reg, q_plan, q_prod, mult = crear_nuevo_registro(
                                 cursor, num, estacion, 0, turno, fecha_fmt, fecha_plan, num_orig, log
                             )
-                            if id_reg is not None and status != 8:
-                                 corrida_previa = 0
-                            prod_start_db = now
+                            if id_reg is None:
+                                continue
+                            # Nuevo registro necesita production_start
+                            necesita_production_start = True
+                            #  CAMBIO: Para registro NUEVO, cnt_turn_start = cnt (0 diferencia)
+                            cnt_turn_start = 0
 
-                        if id_reg is None:
-                            continue
+                        # CASO 2: Hay registro con status 8 → USAR EL MISMO
+                        elif status == 8:
+                            #  CAMBIO IMPORTANTE: Guardar producción anterior en corrida_previa
+                            corrida_previa = q_prod or 0
+                            log.info(f"📥 Registro terminado (status 8) ID {id_reg} con {corrida_previa} piezas ya producidas")
+
+                            # Reactivar registro (8 → 7)
+                            try:
+                                cursor.execute(
+                                    "UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8",
+                                    (id_reg,)
+                                )
+                                log.info(f"✅ Registro {id_reg} reactivado (status 8 → 7)")
+                            except Exception as e:
+                                log.error(f"❌ Error reactivando registro {id_reg}: {e}")
+
+                            # No necesita production_start porque ya lo tiene
+                            necesita_production_start = False
+                            #  CAMBIO: cnt_turn_start = 0 porque ya tenemos corrida_previa
+                            cnt_turn_start = 0
+
+                        # CASO 3: Hay registro ACTIVO (status 3 o 7) → USAR NORMALMENTE
+                        else:
+                            # Status 3 (pendiente) o 7 (produciendo)
+                            if prod_start_db is None and status == 3:
+                                # Registro pendiente sin fecha de inicio
+                                necesita_production_start = True
+                                log.info(f"🔄 Registro activo sin production_start. Se establecerá en primera actualización")
+
+                            #  CAMBIO IMPORTANTE: Si ya hay producción, usarla como corrida_previa
+                            if (q_prod or 0) > 0:
+                                corrida_previa = q_prod
+                                cnt_turn_start = 0  # Ya hay producción acumulada
+                                log.info(f"📋 Registro activo con {corrida_previa} piezas ya producidas")
+                            else:
+                                cnt_turn_start = 0  # No hay producción previa
+                                log.info(f"📋 Registro activo sin producción previa")
+
+                            log.info(f"📋 Registro activo ID {id_reg} con status {status}")
 
                         mult = mult or 1
-
-                        if (q_prod or 0) > 0:
-                            cnt_start_init = cnt
-                        else:
-                            cnt_start_init = 0
 
                         self.active_records[clave] = {
                             'id_registro': id_reg,
@@ -796,9 +1520,10 @@ class IPDataProcessor:
                             'corrida_previa': corrida_previa,
                             'multiplicador': mult,
                             'contador_registro': cnt,
-                            'cnt_turn_start': cnt_start_init,
+                            'cnt_turn_start': cnt_turn_start,  #  SOLO para cambio de turno
                             'hora_cambio': hora,
-                            'numero_original': num_orig
+                            'numero_original': num_orig,
+                            'necesita_production_start': necesita_production_start
                         }
                         state_changed = True
 
@@ -806,48 +1531,104 @@ class IPDataProcessor:
                     if reg['id_registro'] is None:
                         continue
 
-                    cambio_turno = (
-                        (reg["hora_cambio"] < time(8, 0) <= hora) or
-                        (reg["hora_cambio"] < time(20, 0) <= hora)
-                    )
+                    #  CAMBIO: Detectar cambio de turno usando hora_cambio
+                    cambio_turno = has_shift_changed(reg["hora_cambio"], hora)
 
                     if cambio_turno:
-                        cnt_turn_start_base = reg.get('contador_registro', cnt)
-
+                        old_id = reg['id_registro']
                         try:
                             cursor.execute(
-                                "UPDATE production_records SET status_id=8, production_end=? WHERE id=?",
-                                (fecha_fmt, reg['id_registro'])
+                                "UPDATE production_records SET status_id = 8, production_end=? WHERE id=? AND status_id=7",
+                                (fecha_fmt, old_id)
                             )
                         except Exception as e:
-                            log.error(f"Error cerrando registro en cambio de turno: {e}")
+                            log.error(f"Error cerrando registro {old_id}: {e}")
 
-                        id_reg2, q_plan2, q_prod2, status2, prod_start_db2, mult2 = obtener_id_registro_activo(
+                        # Obtener nuevo turno basado en la hora actual
+                        if not SHIFTS_CONFIG:
+                            # Si no hay configuración, usar lógica por defecto
+                            if time(8, 0) <= hora < time(20, 0):
+                                turno = 1
+                            elif hora >= time(20, 0):
+                                turno = 2
+                            else:
+                                turno = 2
+                        else:
+                            # Usar configuración de turnos para determinar nuevo turno
+                            # Simplemente recalcular el turno actual
+                            turno, _ = safe_get_current_shift(hora)
+
+                        # 🔥 REINICIAR para nuevo turno: cnt_turn_start = cnt actual
+                        cnt_turn_start_base = reg.get("contador_registro", cnt)
+
+                        id_reg2, q_plan2, q_prod2, status2, prod_start2, mult2 = obtener_id_registro_activo(
                             cursor, estacion, fecha_plan, turno, num, log
                         )
 
                         corrida_previa2 = 0
-                        if id_reg2 and status2 == 8:
-                            corrida_previa2 = q_prod2 or 0
-                            q_prod2 = 0
+                        necesita_production_start2 = False
 
-                        if id_reg2 is None or status2 == 8:
+                        # 🔥 CASO 1: No hay registro en BD para el nuevo turno → CREAR NUEVO
+                        if id_reg2 is None:
                             id_reg2, q_plan2, q_prod2, mult2 = crear_nuevo_registro(
                                 cursor, num, estacion, 0, turno, fecha_fmt, fecha_plan, num_orig, log
                             )
-                            if id_reg2 is not None and status2 != 8:
-                                 corrida_previa2 = 0
+                            if id_reg2 is None:
+                                log.error(f"No se pudo crear registro para nuevo turno: {num}")
+                                continue
+                            # Nuevo registro necesita production_start
+                            necesita_production_start2 = True
+                            cnt_turn_start2 = cnt  # Iniciar desde el contador actual
 
-                        if id_reg2 is None:
-                            log.error(f"No se pudo crear registro para nuevo turno: {num}")
-                            continue
+                        # 🔥 CASO 2: Hay registro con status 8 → REACTIVAR EL MISMO
+                        elif status2 == 8:
+                            # Guardar producción anterior en corrida_previa2
+                            corrida_previa2 = q_prod2 or 0
+                            log.info(f"📥 Registro terminado (status 8) ID {id_reg2} con {corrida_previa2} piezas ya producidas")
+
+                            # Reactivar registro (8 → 7)
+                            try:
+                                cursor.execute(
+                                    "UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8",
+                                    (id_reg2,)
+                                )
+                                log.info(f"✅ Registro {id_reg2} reactivado (status 8 → 7)")
+                            except Exception as e:
+                                log.error(f"❌ Error reactivando registro {id_reg2}: {e}")
+
+                            # No necesita production_start porque ya lo tiene
+                            necesita_production_start2 = False
+                            # cnt_turn_start2 = cnt (porque ya tenemos corrida_previa2)
+                            cnt_turn_start2 = 0
+
+                        # 🔥 CASO 3: Hay registro ACTIVO (status 3 o 7) → USAR NORMALMENTE
+                        else:
+                            # Status 3 (pendiente) o 7 (produciendo)
+                            if prod_start2 is None and status2 == 3:
+                                # Registro pendiente sin fecha de inicio
+                                necesita_production_start2 = True
+                                log.info(f"🔄 Registro activo sin production_start. Se establecerá en primera actualización")
+
+                            # Si ya hay producción, usarla como corrida_previa2
+                            if (q_prod2 or 0) > 0:
+                                corrida_previa2 = q_prod2
+                                cnt_turn_start2 = 0  # Ya hay producción acumulada
+                                log.info(f"📋 Registro activo con {corrida_previa2} piezas ya producidas")
+                            else:
+                                cnt_turn_start2 = cnt  # No hay producción previa
+                                log.info(f"📋 Registro activo sin producción previa")
+
+                            log.info(f"📋 Registro activo ID {id_reg2} con status {status2}")
+
+                        mult2 = mult2 or 1
 
                         reg['id_registro'] = id_reg2
                         reg['quantity_planeada'] = q_plan2
                         reg['corrida_previa'] = corrida_previa2
-                        reg['multiplicador'] = mult2 or 1
+                        reg['multiplicador'] = mult2
                         reg['hora_cambio'] = hora
-                        reg['cnt_turn_start'] = cnt_turn_start_base
+                        reg['cnt_turn_start'] = cnt_turn_start_base  # Nuevo inicio para el turno
+                        reg['necesita_production_start'] = necesita_production_start2
 
                         state_changed = True
 
@@ -857,17 +1638,30 @@ class IPDataProcessor:
                         multiplicador = reg.get("multiplicador", 1)
                         corrida_previa = reg.get("corrida_previa", 0)
 
-                        golpes_turno_acumulados = cnt - reg.get('cnt_turn_start', cnt)
+                        #  CAMBIO IMPORTANTE: Usar cnt_turn_start SOLO para cambio de turno
 
-                        if golpes_turno_acumulados < 0:
-                            log.warning(f"⚠️ Reset o error de contador detectado en {num}: {prev} -> {cnt}. Reestableciendo base.")
-                            reg["cnt_turn_start"] = 0
-                            golpes_turno_acumulados = cnt
+                        actualizar_registro(
+                            cursor,   golpes_turno_acumulados = cnt - reg.get('cnt_turn_start', cnt)
+
+                        if golpes_turno_acumulados <= 0:
+                            log.warning(f"⚠️ Reset o error de contador detectado en {num}: {prev} -> {cnt}. Reestableciendo cnt_turn_start.")
+                            reg["cnt_turn_start"] = cnt
+                            golpes_turno_acumulados = 0
 
                         prod_turno = golpes_turno_acumulados * multiplicador
+                        #  IMPORTANTE: Sumar corrida_previa que contiene la producción previa
                         qty_upd = prod_turno + corrida_previa
 
-                        actualizar_registro(cursor, qty_upd, fecha_fmt, reg['id_registro'], 7, log)
+                        #  DETERMINAR SI NECESITA PRODUCTION_START
+                        necesita_start = reg.get('necesita_production_start', False)
+
+                            qty_upd,
+                            fecha_fmt,
+                            reg['id_registro'],
+                            7,
+                            log,
+                            necesita_start=necesita_start
+                        )
 
                         pid = obtener_part_number_id(cursor, num, estacion)
                         if pid:
@@ -880,8 +1674,8 @@ class IPDataProcessor:
                             if cantidad_history > 0:
                                 db_strategy.insertar_history(cursor, pid, cantidad_history, fecha_fmt, tiempo, extras)
 
-                        if reg.get('corrida_previa', 0) > 0:
-                            reg['corrida_previa'] = 0
+                        if necesita_start:
+                            reg['necesita_production_start'] = False
 
                         reg['contador_registro'] = cnt
                         reg['hora_cambio'] = hora
@@ -895,8 +1689,7 @@ class IPDataProcessor:
         except Exception as e:
             log.error(f"❌ Error procesando {estacion}: {e}")
             log.error(traceback.format_exc())
-        finally:
-            conn.close()
+        # NOTA: No cerramos la conexión aquí, el pool la maneja
 
 # ═══════════════════════════ ASYNCIO & MAIN LOOPS ═══════════════════════════
 
@@ -904,211 +1697,333 @@ ip_data_queues = {}
 ip_processors = {}
 system_monitor = {'ips': {}, 'estaciones': {}, 'estadisticas': {'errores_conexion': 0, 'inicio_sistema': datetime.now()}}
 
-async def plc_reader(ip, port, group_info):
-    plc = Type3E()
-    plc.network = 0
-    plc.pc = 0xFF
-    plc.timer = 30  # 🔥 AUMENTADO: Tiempo de espera para respuesta del PLC (30 segundos)
-
-    # 🔥 NUEVO: Configurar socket timeout directamente
+#  NUEVO: Función para conectar al PLC con timeout
+async def connect_plc_with_timeout(plc, ip, port, timeout=PLC_CONNECTION_TIMEOUT):
+    """Conecta al PLC con timeout controlado"""
     try:
-        plc.soc_timeout = 10.0  # Timeout del socket en segundos
-    except:
-        pass
+        # Usar run_in_executor para evitar bloquear el event loop
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, plc.connect, ip, port),
+            timeout=timeout
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.warning(f"⏱️ Timeout al conectar con PLC {ip}:{port}")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️ Error conectando con PLC {ip}:{port}: {str(e)[:100]}")
+        return False
 
-    connected = False
+async def plc_reader(ip, port, group_info):
+    """Lector optimizado para PLC con manejo de errores mejorado"""
+
     collector = IPDataCollector(ip, group_info['estaciones'], group_info.get('area', 'Default'))
 
     if ip not in ip_data_queues:
         ip_data_queues[ip] = asyncio.Queue(maxsize=1000)
 
+    #  NUEVO: Configuración inicial del PLC
+    def create_plc_instance():
+        """Crea una nueva instancia del PLC"""
+        plc = Type3E()
+        plc.network = 0
+        plc.pc = 0xFF
+        plc.timer = PLC_READ_TIMEOUT
+        try:
+            plc.soc_timeout = PLC_READ_TIMEOUT
+        except:
+            pass
+        return plc
+
+    plc = create_plc_instance()
+    connected = False
+    consecutive_failures = 0
+    max_consecutive_failures = 3
+
+    #  NUEVO: Intervalo de lectura más inteligente
+    last_read_time = datetime.now()
+    read_interval = 1.0  # Leer cada 1 segundo
+
+    #  NUEVO: Direcciones para lectura
+    addrs = list(group_info['all_addresses']) if 'all_addresses' in group_info else []
+
     while True:
         try:
             if not connected:
-                for est in group_info['estaciones']:
-                    get_station_logger(est).warning(f"Conectando PLC {ip}...")
+                logger.info(f"🔌 Intentando conectar a PLC {ip}:{port}")
 
-                await asyncio.to_thread(plc.connect, ip, port)
-                connected = True
-                system_monitor['ips'][ip] = {
-                    'conectado': True,
-                    'estaciones': group_info['estaciones'],
-                    'procesando': False,
-                    'ultima_lectura': datetime.now()
-                }
+                # Intentar conexión con timeout
+                connected = await connect_plc_with_timeout(plc, ip, port)
 
-            await collector.collect_and_enqueue(plc, group_info)
-            await asyncio.sleep(1)  # 🔥 CAMBIADO: De 0.1 a 1 segundo entre lecturas
+                if connected:
+                    consecutive_failures = 0
+                    logger.info(f"✅ Conectado a PLC {ip}:{port}")
+
+                    # Actualizar monitor
+                    system_monitor['ips'][ip] = {
+                        'conectado': True,
+                        'estaciones': group_info['estaciones'],
+                        'procesando': False,
+                        'ultima_lectura': datetime.now(),
+                        'conexion_establecida': datetime.now()
+                    }
+
+                    # Notificar a las estaciones
+                    for est in group_info['estaciones']:
+                        get_station_logger(est).info(f"✅ PLC {ip} conectado")
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(f"❌ Múltiples fallos de conexión con PLC {ip}, esperando {RECONNECT_DELAY}s")
+                        await asyncio.sleep(RECONNECT_DELAY)
+                    else:
+                        await asyncio.sleep(2)  # Espera corta entre intentos
+                    continue
+
+            #  LECTURA DEL PLC
+            current_time = datetime.now()
+            time_since_last_read = (current_time - last_read_time).total_seconds()
+
+            if time_since_last_read >= read_interval:
+                try:
+                    # Leer datos
+                    await collector.collect_and_enqueue(plc, group_info, addrs)
+                    last_read_time = current_time
+
+                except Exception as read_error:
+                    logger.error(f" Error en lectura PLC {ip}: {str(read_error)[:100]}")
+                    connected = False
+                    plc = create_plc_instance()  # Recrear instancia
+                    await asyncio.sleep(1)
+
+            #  ESPERA INTELIGENTE
+            time_to_wait = max(0, read_interval - (datetime.now() - current_time).total_seconds())
+            if time_to_wait > 0:
+                await asyncio.sleep(time_to_wait)
 
         except Exception as e:
+            logger.error(f"❌ Error crítico en plc_reader para {ip}: {str(e)[:200]}")
             connected = False
-            error_msg = str(e)
-
-            # 🔥 NUEVO: Mensajes de error más descriptivos
-            if "Invalid device" in error_msg:
-                for est in group_info['estaciones']:
-                    get_station_logger(est).error(f"❌ PLC {ip} - DIRECCIÓN INVÁLIDA: {error_msg}")
-            elif "timed out" in error_msg:
-                for est in group_info['estaciones']:
-                    get_station_logger(est).error(f"⏱️ PLC {ip} - TIMEOUT: No responde en el tiempo límite")
-            else:
-                for est in group_info['estaciones']:
-                    get_station_logger(est).error(f"⚠️ PLC OFFLINE {ip}: {e}")
-
-            if ip in system_monitor['ips']:
-                system_monitor['ips'][ip]['conectado'] = False
-
-            if ip in ip_data_queues:
-                for est in group_info['estaciones']:
-                    try:
-                        ip_data_queues[ip].put_nowait([{
-                            'estacion': est,
-                            'datos': [],
-                            'ts': datetime.now(),
-                            'area': group_info.get('area', 'Default'),
-                            'plc_ok': False
-                        }])
-                    except asyncio.QueueFull:
-                        pass
-
-            await asyncio.sleep(5)
+            plc = create_plc_instance()
+            await asyncio.sleep(RECONNECT_DELAY)
 
 async def supervisor():
     tasks = {}
+    last_successful_config = {}
+    config_failures = 0
+    max_config_failures = 5
+    last_status_log = datetime.now()
+
+    # 🔄 Cargar turnos al inicio
+    refresh_shifts_config()
+
+    logger.info("🚀 Supervisor iniciado")
+
     while True:
-        ip_groups = load_config()
+        try:
+            config = load_config()
 
-        for ip, info in ip_groups.items():
-            if ip not in tasks:
-                tasks[ip] = asyncio.create_task(plc_reader(ip, info['port'], info))
-                if ip not in ip_processors:
-                    proc = IPDataProcessor(ip)
-                    ip_processors[ip] = proc
-                    asyncio.create_task(proc.process_continuously())
+            if not config:
+                config_failures += 1
+                if config_failures >= max_config_failures:
+                    logger.warning(f"⚠️ {config_failures} fallos consecutivos cargando config. Reintentando en {POLL_INTERVAL}s...")
+                    if last_successful_config:
+                        # Solo mostrar cada 60 segundos para no saturar logs
+                        current_time = datetime.now()
+                        if (current_time - last_status_log).total_seconds() > 60:
+                            logger.info("📋 Usando última configuración válida")
+                            last_status_log = current_time
+                        config = last_successful_config
+                    else:
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
+                else:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+            else:
+                if config_failures > 0:
+                    logger.info("✅ Configuración cargada exitosamente después de fallos")
+                config_failures = 0
+                last_successful_config = config
 
-        await asyncio.sleep(POLL_INTERVAL)
+            ips_actuales = set(config.keys())
 
-# ═══════════════════════════ UI MODERNA ═══════════════════════════
+            # Iniciar nuevas tareas para IPs que no existen
+            for ip in ips_actuales:
+                if ip not in tasks:
+                    port = config[ip]['port']
+                    logger.info(f"🔌 Iniciando PLC reader para {ip}:{port}")
+
+                    #  CORRECCIÓN CRÍTICA: Crear cola ANTES del procesador
+                    # Esto evita la condición de carrera
+                    if ip not in ip_data_queues:
+                        ip_data_queues[ip] = asyncio.Queue(maxsize=1000)
+
+                    # Crear procesador y su tarea
+                    if ip not in ip_processors:
+                        processor = IPDataProcessor(ip)
+                        ip_processors[ip] = processor
+
+                        proc_task = asyncio.create_task(processor.process_continuously())
+                        tasks[f"{ip}_processor"] = proc_task
+
+                    # Crear tarea de lectura
+                    reader_task = asyncio.create_task(plc_reader(ip, port, config[ip]))
+                    tasks[ip] = reader_task
+
+            # Detener tareas para IPs que ya no existen
+            for ip in list(tasks.keys()):
+                if ip.endswith('_processor'):
+                    continue
+
+                if ip not in ips_actuales:
+                    logger.info(f"🛑 Deteniendo PLC reader para {ip}")
+                    tasks[ip].cancel()
+                    del tasks[ip]
+
+                    # Detener procesador también
+                    proc_key = f"{ip}_processor"
+                    if proc_key in tasks:
+                        tasks[proc_key].cancel()
+                        del tasks[proc_key]
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+        except Exception as e:
+            logger.error(f"❌ Error en supervisor: {e}")
+            logger.error(traceback.format_exc())
+            await asyncio.sleep(POLL_INTERVAL)
+
+# ═══════════════════════════ UI MODERNA (CustomTkinter) ═══════════════════════════
 
 class ModernDashboardUI:
     def __init__(self):
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
+        ctk.set_default_color_theme("blue")
 
         self.root = ctk.CTk()
-        self.root.title("🏭 IOT MONITOR - FACTORY DASHBOARD")
-        self.root.geometry("1600x900")
+        self.root.title("🖥️ Monitor de Prensas - Sistema de Producción")
+        self.root.geometry("1400x800")
 
-        self.root.grid_columnconfigure(1, weight=1)
-        self.root.grid_rowconfigure(0, weight=1)
-
+        # Variables para búsqueda
         self.search_var = StringVar()
-        self.search_var.trace("w", lambda *args: self.filter_stations())
+        self.search_var.trace('w', lambda *args: self.filter_stations())
 
-        # 🔥 NUEVO: Diccionario para mantener referencias a items del tree
+        # Diccionario para mapear estaciones a items del tree
         self.station_items = {}
 
-        self.create_sidebar()
-        self.create_main()
+        # Variable para el botón de actualizar turnos
+        self.refresh_shifts_btn = None
+
+        self.build_ui()
         self.update_loop()
 
-    def create_sidebar(self):
-        sb = ctk.CTkFrame(self.root, width=240, corner_radius=0)
-        sb.grid(row=0, column=0, sticky="nsew")
-        sb.grid_propagate(False)
+    def build_ui(self):
+        # Frame principal
+        main_frame = ctk.CTkFrame(self.root)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        header_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        header_frame.pack(pady=20, padx=10)
+        # Panel superior con estadísticas Y BOTÓN
+        stats_frame = ctk.CTkFrame(main_frame)
+        stats_frame.pack(fill="x", padx=10, pady=(10, 5))
 
-        ctk.CTkLabel(header_frame, text="🏭", font=("Arial", 40)).pack()
-        ctk.CTkLabel(header_frame, text="MONITOR", font=("Arial", 22, "bold")).pack()
-        ctk.CTkLabel(header_frame, text="PRENSAS", font=("Arial", 18)).pack()
+        # Frame interno para organizar mejor
+        stats_container = ctk.CTkFrame(stats_frame)
+        stats_container.pack(fill="x", padx=20, pady=15)
 
-        separator = ctk.CTkFrame(sb, height=2, fg_color="#3a3a3a")
-        separator.pack(fill="x", padx=20, pady=10)
-
-        stats_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        stats_frame.pack(pady=10, padx=15, fill="x")
-
+        # Fila 1: Estadísticas
         self.lbl_ips = ctk.CTkLabel(
-            stats_frame,
-            text="🌐 IPs: 0",
-            font=("Arial", 16),
-            anchor="w"
+            stats_container,
+            text="🌐 IPs Online: 0/0",
+            font=("Arial", 16, "bold")
         )
-        self.lbl_ips.pack(pady=8, fill="x")
+        self.lbl_ips.grid(row=0, column=0, padx=20, pady=5, sticky="w")
 
         self.lbl_est = ctk.CTkLabel(
-            stats_frame,
+            stats_container,
             text="📍 Estaciones: 0",
-            font=("Arial", 16),
-            anchor="w"
+            font=("Arial", 16, "bold")
         )
-        self.lbl_est.pack(pady=8, fill="x")
+        self.lbl_est.grid(row=0, column=1, padx=20, pady=5, sticky="w")
 
         self.lbl_online = ctk.CTkLabel(
-            stats_frame,
+            stats_container,
             text="✅ Online: 0",
-            font=("Arial", 16),
-            anchor="w"
+            font=("Arial", 16, "bold"),
+            text_color="green"
         )
-        self.lbl_online.pack(pady=8, fill="x")
+        self.lbl_online.grid(row=0, column=2, padx=20, pady=5, sticky="w")
 
         self.lbl_offline = ctk.CTkLabel(
-            stats_frame,
+            stats_container,
             text="❌ Offline: 0",
-            font=("Arial", 16),
-            anchor="w"
+            font=("Arial", 16, "bold"),
+            text_color="red"
         )
-        self.lbl_offline.pack(pady=8, fill="x")
+        self.lbl_offline.grid(row=0, column=3, padx=20, pady=5, sticky="w")
 
-        footer_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        footer_frame.pack(side="bottom", pady=20, padx=15)
+        # Fila 2: Botón de actualizar turnos y uptime
+        self.refresh_shifts_btn = ctk.CTkButton(
+            stats_container,
+            text="🔄 Actualizar Turnos",
+            command=self.refresh_shifts,
+            width=200,
+            font=("Arial", 14, "bold"),
+            fg_color="#4CAF50",
+            hover_color="#45a049"
+        )
+        self.refresh_shifts_btn.grid(row=1, column=0, columnspan=2, padx=20, pady=10, sticky="w")
 
         self.lbl_uptime = ctk.CTkLabel(
-            footer_frame,
+            stats_container,
             text="⏱️ Uptime: 00:00:00",
-            font=("Arial", 13),
-            text_color="#888888"
+            font=("Arial", 16, "bold")
         )
-        self.lbl_uptime.pack()
+        self.lbl_uptime.grid(row=1, column=2, columnspan=2, padx=20, pady=10, sticky="w")
 
-    def create_main(self):
-        main = ctk.CTkFrame(self.root, fg_color="transparent")
-        main.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
-        main.grid_rowconfigure(1, weight=1)
-        main.grid_columnconfigure(0, weight=1)
+        # Añadir label para mostrar estado de turnos
+        self.lbl_shifts_status = ctk.CTkLabel(
+            stats_container,
+            text="Turnos: No cargados",
+            font=("Arial", 12),
+            text_color="gray"
+        )
+        self.lbl_shifts_status.grid(row=2, column=0, columnspan=4, padx=20, pady=(5, 0), sticky="w")
 
-        search_frame = ctk.CTkFrame(main)
-        search_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        search_frame.grid_columnconfigure(1, weight=1)
+        # Panel de búsqueda
+        search_frame = ctk.CTkFrame(main_frame)
+        search_frame.pack(fill="x", padx=10, pady=5)
 
         ctk.CTkLabel(
             search_frame,
-            text="🔍",
-            font=("Arial", 20)
-        ).grid(row=0, column=0, padx=(10, 5), pady=10)
+            text="🔍 Buscar:",
+            font=("Arial", 14, "bold")
+        ).pack(side="left", padx=(20, 10), pady=10)
 
-        self.search_entry = ctk.CTkEntry(
+        search_entry = ctk.CTkEntry(
             search_frame,
-            placeholder_text="Buscar por estación o IP...",
             textvariable=self.search_var,
-            height=40,
-            font=("Arial", 14)
+            placeholder_text="Nombre de estación o IP...",
+            width=400,
+            font=("Arial", 12)
         )
-        self.search_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=10)
+        search_entry.pack(side="left", padx=(0, 20), pady=10)
 
-        tree_frame = ctk.CTkFrame(main)
-        tree_frame.grid(row=1, column=0, sticky="nsew")
+        # Tabla de estaciones
+        tree_frame = ctk.CTkFrame(main_frame)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        # 🔥 CAMBIO: Sin columna "Detalle"
-        cols = ("Estación", "Área", "IP", "Parte Original", "Contador", "Estado")
-
+        # Scrollbar
         scrollbar = ctk.CTkScrollbar(tree_frame)
         scrollbar.pack(side="right", fill="y")
 
+        # Definir columnas
+        cols = ("Estación", "Área", "IP", "Parte Original", "Contador", "Estado")
+
+        # Configurar estilo del Treeview
         style = ttk.Style()
-        style.theme_use("clam")
+        style.theme_use("default")
         style.configure(
             "Treeview",
             background="#2b2b2b",
@@ -1148,11 +2063,101 @@ class ModernDashboardUI:
 
         self.tree.pack(fill="both", expand=True)
 
+    def refresh_shifts(self):
+        """Función para recargar configuración de turnos"""
+        # Deshabilitar botón mientras se actualiza
+        self.refresh_shifts_btn.configure(
+            text="⏳ Actualizando...",
+            state="disabled",
+            fg_color="gray"
+        )
+        self.root.update()  # Forzar actualización de UI
+
+        try:
+            # Llamar a la función de actualización
+            success = refresh_shifts_config()
+
+            if success:
+                # Mostrar confirmación temporal
+                self.lbl_shifts_status.configure(
+                    text=f"✅ Turnos actualizados: {len(SHIFTS_CONFIG)} turnos cargados",
+                    text_color="green"
+                )
+
+                # Actualizar columna de área en la tabla (si los turnos están relacionados con áreas)
+                self.update_shifts_in_table()
+
+                # Restaurar botón después de 2 segundos
+                self.root.after(2000, lambda: self.reset_shifts_button("✅ Turnos actualizados"))
+            else:
+                self.lbl_shifts_status.configure(
+                    text="❌ Error actualizando turnos",
+                    text_color="red"
+                )
+                self.root.after(2000, lambda: self.reset_shifts_button("❌ Error, reintentar"))
+
+        except Exception as e:
+            logger.error(f"❌ Error en actualización de turnos: {e}")
+            self.lbl_shifts_status.configure(
+                text="❌ Error en actualización",
+                text_color="red"
+            )
+            self.root.after(2000, lambda: self.reset_shifts_button("❌ Error, reintentar"))
+
+    def reset_shifts_button(self, text=None):
+        """Restaura el botón a su estado normal"""
+        if text is None:
+            text = "🔄 Actualizar Turnos"
+
+        self.refresh_shifts_btn.configure(
+            text=text,
+            state="normal",
+            fg_color="#4CAF50",
+            hover_color="#45a049"
+        )
+
+        # Restaurar texto del estado después de 3 segundos más
+        self.root.after(3000, lambda: self.lbl_shifts_status.configure(
+            text=f"Turnos: {len(SHIFTS_CONFIG)} cargados" if SHIFTS_CONFIG else "Turnos: No cargados",
+            text_color="gray"
+        ))
+
+    def update_shifts_in_table(self):
+        """Actualiza información de turnos en la tabla si es necesario"""
+        # Si los turnos afectan cómo se muestran las áreas, actualizar aquí
+        for estacion, info in system_monitor['estaciones'].items():
+            if estacion in self.station_items:
+                # Obtener valores actualizados
+                vals = self.get_station_values(estacion, info)
+                self.tree.item(self.station_items[estacion], values=vals)
+
+    def get_station_values(self, estacion, info):
+        """Obtiene valores formateados para una estación"""
+        diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
+        ip = info.get('ip', '--')
+        plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
+
+        if not plc_connected:
+            status = "🔴 PLC OFFLINE"
+        elif diff < 60:
+            status = "🟢 Online"
+        else:
+            status = "🟡 Sin datos"
+
+        return (
+            estacion,
+            info.get('area', 'N/A'),
+            ip,
+            info.get('parte_actual', '--'),
+            info.get('contador', 0),
+            status
+        )
+
     def filter_stations(self):
         """Filtrar estaciones por búsqueda"""
         search_text = self.search_var.get().lower()
 
-        # 🔥 CAMBIO: No limpiar, solo actualizar items existentes
+        #  CAMBIO: No limpiar, solo actualizar items existentes
         items = sorted(system_monitor['estaciones'].items(), key=lambda x: x[0])
 
         for est, info in items:
@@ -1168,7 +2173,7 @@ class ModernDashboardUI:
             ip = info.get('ip', '--')
             plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
 
-            # 🔥 CAMBIO: Solo OFFLINE cuando no hay conexión con PLC
+            #  CAMBIO: Solo OFFLINE cuando no hay conexión con PLC
             if not plc_connected:
                 status = "🔴 PLC OFFLINE"
             elif diff < 60:
@@ -1185,7 +2190,7 @@ class ModernDashboardUI:
                 status
             )
 
-            # 🔥 CAMBIO: Actualizar item existente o crear nuevo
+            #  CAMBIO: Actualizar item existente o crear nuevo
             if est in self.station_items:
                 self.tree.item(self.station_items[est], values=vals)
             else:
@@ -1219,6 +2224,20 @@ class ModernDashboardUI:
         minutes, seconds = divmod(remainder, 60)
         self.lbl_uptime.configure(text=f"⏱️ Uptime: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
+        # Actualizar información de turnos en UI
+        if SHIFTS_CONFIG:
+            turnos_info = ", ".join([f"{data['name']} ({data['start'].strftime('%H:%M')})"
+                                     for data in SHIFTS_CONFIG.values()][:2])
+            self.lbl_shifts_status.configure(
+                text=f"Turnos: {turnos_info}",
+                text_color="gray"
+            )
+        else:
+            self.lbl_shifts_status.configure(
+                text="Turnos: No cargados",
+                text_color="orange"
+            )
+
         self.filter_stations()
 
         self.root.after(1000, self.update_loop)
@@ -1226,16 +2245,105 @@ class ModernDashboardUI:
     def run(self):
         self.root.mainloop()
 
-# ═══════════════════════════ MAIN ═══════════════════════════
+# ═══════════════════════════ MAIN OPTIMIZADO ═══════════════════════════
 
 def start_async():
+    """Inicia el loop asyncio con manejo de errores mejorado"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(supervisor())
+
+    #  CONFIGURAR MANEJADOR DE EXCEPCIONES NO CAPTURADAS
+    def handle_exception(loop, context):
+        msg = context.get("exception", context["message"])
+        logger.error(f"🚨 Excepción no capturada en loop asyncio: {msg}")
+
+    loop.set_exception_handler(handle_exception)
+
+    try:
+        logger.info("🔄 Iniciando loop asyncio...")
+        loop.run_until_complete(supervisor())
+    except KeyboardInterrupt:
+        logger.info("👋 Detención solicitada por usuario")
+    except Exception as e:
+        logger.error(f"❌ Error crítico en el loop asyncio: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("🛑 Cerrando loop asyncio...")
+        # Cancelar todas las tareas pendientes
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+
+        # Esperar a que las tareas se cancelen
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+        # 🔥 Cerrar todas las conexiones del pool
+        ConnectionPool.close_all()
+
+        loop.close()
+        logger.info("✅ Loop asyncio cerrado correctamente")
 
 if __name__ == '__main__':
+    #  CONFIGURAR LOGGING MÁS DETALLADO PARA DEBUG
+    debug_handler = logging.StreamHandler()
+    debug_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    debug_handler.setFormatter(formatter)
+    logger.addHandler(debug_handler)
 
-    t = threading.Thread(target=start_async, daemon=True)
-    t.start()
-    app = ModernDashboardUI()
-    app.run()
+    #  VERIFICAR VARIABLES DE ENTORNO
+    required_env_vars = ['DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
+    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+
+    if missing_vars:
+        logger.error(f"❌ Faltan variables de entorno críticas: {missing_vars}")
+        logger.error("Asegúrate de configurar el archivo .env correctamente")
+
+        # Crear una UI mínima para mostrar el error
+        ctk.set_appearance_mode("dark")
+        root = ctk.CTk()
+        root.title("ERROR - Configuración")
+        root.geometry("600x300")
+
+        error_frame = ctk.CTkFrame(root)
+        error_frame.pack(pady=50, padx=50, fill="both", expand=True)
+
+        ctk.CTkLabel(
+            error_frame,
+            text="❌ ERROR DE CONFIGURACIÓN",
+            font=("Arial", 24, "bold"),
+            text_color="red"
+        ).pack(pady=20)
+
+        ctk.CTkLabel(
+            error_frame,
+            text=f"Faltan variables de entorno: {', '.join(missing_vars)}",
+            font=("Arial", 16),
+            wraplength=500
+        ).pack(pady=10)
+
+        ctk.CTkLabel(
+            error_frame,
+            text="Verifica el archivo .env en la carpeta del proyecto",
+            font=("Arial", 14),
+            text_color="yellow"
+        ).pack(pady=10)
+
+        root.mainloop()
+    else:
+        logger.info("✅ Todas las variables de entorno críticas están configuradas")
+
+        #  INICIAR EN MODO DEBUG PARA DIAGNÓSTICO
+        logger.info("🔧 Iniciando en modo debug...")
+        logger.info(f"Python version: {sys.version}")
+
+        # Iniciar thread asíncrono
+        t = threading.Thread(target=start_async, daemon=True)
+        t.start()
+        logger.info("🧵 Thread asíncrono iniciado")
+
+        # Iniciar UI
+        logger.info("🖥️  Iniciando interfaz de usuario...")
+        app = ModernDashboardUI()
+        app.run()
