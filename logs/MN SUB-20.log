@@ -1,0 +1,7 @@
+2026-01-26 11:39:55,801 - INFO - ✅ PLC 10.1.4.25 conectado
+2026-01-26 11:40:02,639 - INFO - ✅ Número de parte encontrado en BD: ID=10471, number=BDTS5435P, estacion=MN SUB-20, obsolete=False
+2026-01-26 11:40:02,640 - INFO - 🔍 Intentando crear registro para: numero_parte=BDTS5435P, estacion=MN SUB-20, turno=1
+2026-01-26 11:40:02,681 - INFO - ✅ Registro creado exitosamente: ID=10268, numero_parte=BDTS5435P
+2026-01-26 11:40:02,687 - INFO - ✅ Número de parte encontrado en BD: ID=10470, number=BDTS5318P, estacion=MN SUB-20, obsolete=False
+2026-01-26 11:40:02,688 - INFO - 🔍 Intentando crear registro para: numero_parte=BDTS5318P, estacion=MN SUB-20, turno=1
+2026-01-26 11:40:02,692 - INFO - ✅ Registro creado exitosamente: ID=10269, numero_parte=BDTS5318P

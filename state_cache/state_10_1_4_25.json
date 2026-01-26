@@ -1,0 +1,24 @@
+{
+    "MN SUB-20_BDTS5435P": {
+        "id_registro": 10268,
+        "quantity_planeada": 0,
+        "corrida_previa": 0,
+        "multiplicador": 1,
+        "contador_registro": 108,
+        "cnt_turn_start": 0,
+        "hora_cambio": "11:39:56",
+        "numero_original": "BDTS5435P",
+        "necesita_production_start": true
+    },
+    "MN SUB-20_BDTS5318P": {
+        "id_registro": 10269,
+        "quantity_planeada": 0,
+        "corrida_previa": 0,
+        "multiplicador": 1,
+        "contador_registro": 106,
+        "cnt_turn_start": 0,
+        "hora_cambio": "11:39:56",
+        "numero_original": "BDTS5318P",
+        "necesita_production_start": true
+    }
+}

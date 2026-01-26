@@ -1639,9 +1639,7 @@ class IPDataProcessor:
                         corrida_previa = reg.get("corrida_previa", 0)
 
                         #  CAMBIO IMPORTANTE: Usar cnt_turn_start SOLO para cambio de turno
-
-                        actualizar_registro(
-                            cursor,   golpes_turno_acumulados = cnt - reg.get('cnt_turn_start', cnt)
+                        golpes_turno_acumulados = cnt - reg.get('cnt_turn_start', cnt)
 
                         if golpes_turno_acumulados <= 0:
                             log.warning(f"⚠️ Reset o error de contador detectado en {num}: {prev} -> {cnt}. Reestableciendo cnt_turn_start.")
@@ -1655,6 +1653,8 @@ class IPDataProcessor:
                         #  DETERMINAR SI NECESITA PRODUCTION_START
                         necesita_start = reg.get('necesita_production_start', False)
 
+                        actualizar_registro(
+                            cursor,
                             qty_upd,
                             fecha_fmt,
                             reg['id_registro'],

@@ -1,0 +1,31 @@
+2026-01-26 11:39:55,335 - INFO - ✅ Todas las variables de entorno críticas están configuradas
+2026-01-26 11:39:55,337 - INFO - 🔧 Iniciando en modo debug...
+2026-01-26 11:39:55,337 - INFO - Python version: 3.13.2 (tags/v3.13.2:4f8bb39, Feb  4 2025, 15:23:48) [MSC v.1942 64 bit (AMD64)]
+2026-01-26 11:39:55,342 - INFO - 🧵 Thread asíncrono iniciado
+2026-01-26 11:39:55,343 - INFO - 🖥️  Iniciando interfaz de usuario...
+2026-01-26 11:39:55,507 - INFO - 🔄 Iniciando loop asyncio...
+2026-01-26 11:39:55,763 - INFO - ✅ Turnos cargados: 2 turnos
+2026-01-26 11:39:55,764 - INFO -    Turno 1 (Diurno): 08:00 - 20:00
+2026-01-26 11:39:55,765 - INFO -    Turno 2 (Nocturno): 20:00 - 08:00
+2026-01-26 11:39:55,765 - INFO - 🔄 Configuración de turnos actualizada desde BD
+2026-01-26 11:39:55,766 - INFO - 🚀 Supervisor iniciado
+2026-01-26 11:39:55,788 - INFO - 📋 Configuración cargada: 5 IPs, 5 estaciones
+2026-01-26 11:39:55,788 - INFO - 🔌 Iniciando PLC reader para 10.1.1.4:5002
+2026-01-26 11:39:55,789 - INFO - 🔌 Iniciando PLC reader para 10.1.1.8:5002
+2026-01-26 11:39:55,790 - INFO - 🔌 Iniciando PLC reader para 10.1.1.1:5002
+2026-01-26 11:39:55,790 - INFO - 🔌 Iniciando PLC reader para 10.1.4.25:1025
+2026-01-26 11:39:55,790 - INFO - 🔌 Iniciando PLC reader para 10.1.1.5:5002
+2026-01-26 11:39:55,792 - INFO - 🔌 Intentando conectar a PLC 10.1.1.4:5002
+2026-01-26 11:39:55,794 - INFO - 🔌 Intentando conectar a PLC 10.1.1.8:5002
+2026-01-26 11:39:55,795 - INFO - 🔌 Intentando conectar a PLC 10.1.1.1:5002
+2026-01-26 11:39:55,796 - INFO - 🔌 Intentando conectar a PLC 10.1.4.25:1025
+2026-01-26 11:39:55,796 - INFO - 🔌 Intentando conectar a PLC 10.1.1.5:5002
+2026-01-26 11:39:55,799 - INFO - ✅ Conectado a PLC 10.1.4.25:1025
+2026-01-26 11:39:55,801 - INFO - ✅ Conectado a PLC 10.1.1.5:5002
+2026-01-26 11:39:55,816 - INFO - ✅ Conectado a PLC 10.1.1.1:5002
+2026-01-26 11:39:55,819 - INFO - ✅ Conectado a PLC 10.1.1.8:5002
+2026-01-26 11:39:55,826 - INFO - ✅ Conectado a PLC 10.1.1.4:5002
+2026-01-26 11:40:02,477 - INFO - 📝 NUEVO registro: HOT STAMPING 2 - VA40 70 71 T30
+2026-01-26 11:40:02,498 - INFO - ℹ️ Ya registrado HOY: HOT STAMPING 2 - VA40 70 71 T30
+2026-01-26 11:40:02,530 - INFO - ℹ️ Ya registrado HOY: HOT STAMPING 2 - VA40 70 71 T30
+2026-01-26 11:40:02,706 - INFO - ℹ️ Ya registrado HOY: HOT STAMPING 2 - VA40 70 71 T30
