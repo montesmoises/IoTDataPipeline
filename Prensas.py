@@ -65,14 +65,18 @@ logger.addHandler(console_handler)
 station_loggers = {}
 
 # Intervalo (en segundos) para volver a leer la configuración de la BD
-POLL_INTERVAL = 5
+POLL_INTERVAL = 60  # 🚀 Aumentado a 60s (se puede forzar update manual)
+
+# Variables globales para control de actualización manual
+global_async_loop = None
+global_config_event = None
 
 # Archivo CSV de números de parte no encontrados
 CSV_FILE = CSV_DIR / "parts_not_found.csv"
 
 #  CONFIGURACIÓN GLOBAL DE CONEXIÓN PLC
-PLC_CONNECTION_TIMEOUT = 5  # 5 segundos de timeout
-PLC_READ_TIMEOUT = 3        # 3 segundos para lectura
+PLC_CONNECTION_TIMEOUT = 15  # 5 segundos de timeout
+PLC_READ_TIMEOUT = 10        # 3 segundos para lectura
 RECONNECT_DELAY = 10        # 10 segundos entre reconexiones fallidas
 
 # ═══════════════════════════ POOL DE CONEXIONES ═══════════════════════════
@@ -793,8 +797,7 @@ def crear_nuevo_registro(cursor, numero_parte, estacion, contador, turno, fecha_
             log.info(f"✅ Número de parte encontrado en BD: ID={check_result[0]}, number={check_result[1]}, estacion={check_result[2]}, obsolete={check_result[3]}")
             if check_result[3] == 1:
                 log.warning(f"⚠️ El número de parte {numero_parte} está marcado como OBSOLETO")
-                registrar_error_validacion(estacion, num_orig, "PART_NUMBER_OBSOLETO")
-                return None, None, None, None
+                return None, None, None, None, "PART_NUMBER_OBSOLETO"
         else:
             log.warning(f"⚠️ Número de parte {numero_parte} NO existe en part_numbers para estación {estacion}")
             log.warning(f"   Intentando buscar sin remover espacios...")
@@ -805,8 +808,7 @@ def crear_nuevo_registro(cursor, numero_parte, estacion, contador, turno, fecha_
                 log.info(f"   Encontrado con espacios: {alt_result[0]}")
             else:
                 log.warning(f"   Tampoco encontrado con espacios originales")
-                registrar_error_validacion(estacion, num_orig, "PART_NUMBER_NO_EXISTE_BD")
-                return None, None, None, None
+                return None, None, None, None, "PART_NUMBER_NO_EXISTE_BD"
     except Exception as e:
         log.error(f"Error en verificación previa: {e}")
 
@@ -825,17 +827,15 @@ def crear_nuevo_registro(cursor, numero_parte, estacion, contador, turno, fecha_
         if res:
             mult = obtener_multiplicador_as400(numero_parte, estacion, log)
             log.info(f"✅ Registro creado exitosamente: ID={res[0]}, numero_parte={numero_parte}")
-            return res[0], res[1], res[2], mult
+            return res[0], res[1], res[2], mult, None
         else:
             log.warning(f"⚠️ No se pudo crear registro para {numero_parte} - La consulta no retornó resultados")
             log.warning(f"   Esto significa que el número de parte no existe en part_numbers o no está asociado a {estacion}")
-            #  MODIFICADO: Ahora usa la función registrar_error_validacion en lugar de escribir directo
-            registrar_error_validacion(estacion, num_orig, "SQL_NO_ENCONTRADO")
-            return None, None, None, None
+            return None, None, None, None, "SQL_NO_ENCONTRADO"
     except Exception as e:
         log.error(f"❌ Error crear registro para {numero_parte}: {e}")
         log.error(f"   Parámetros: contador={contador}, turno={turno}, estacion={estacion}")
-        return None, None, None, None
+        return None, None, None, None, "DB_ERROR"
 
 def obtener_part_number_id(cursor, numero_parte, estacion):
     sql = "SELECT pn.id FROM part_numbers pn JOIN work_centers wc ON pn.work_center_id = wc.id WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=?"
@@ -891,7 +891,12 @@ def decodificar_bloque(bloque):
 
     chars = [chr(v & 0xFF) + chr((v >> 8) & 0xFF) for v in bloque]
     original = "".join(chars).replace("\x00", "")
-    limpia = original.strip()
+    
+    # Filtrar caracteres no imprimibles del PLC
+    original = ''.join(c for c in original if c.isprintable()).strip()
+    
+    # limpia = original.strip()
+    limpia = original.replace(' ', '')
 
     if not limpia:
         return original, [], {}
@@ -961,13 +966,12 @@ def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> list:
         # NOTA: No cerramos la conexión aquí, el pool la maneja
         pass
 
-    # Si no hay números de parte posibles, registrar error y retornar lista vacía
+    # Si no hay números de parte posibles, retornar lista vacía (el error se consolida arriba)
     if not numeros_parte_posibles:
-        log.warning(f"⚠️ No se encontraron números de parte para MDI={mdi}")
-        #  NUEVO: Registrar en CSV cuando no se encuentran números en AS400
-        registrar_error_validacion(estacion, mdi, "MDI_NO_ENCONTRADO_AS400")
-        validacion_estampado_cache[cache_key] = []
-        return []
+        log.warning(f"⚠️ No se encontraron números de parte para MDI={mdi} en AS400")
+        res = ([], "MDI_NO_ENCONTRADO_AS400")
+        validacion_estampado_cache[cache_key] = res
+        return res
 
     # Ahora validar contra SQL Server para filtrar por estación
     conn_sql = create_connection()
@@ -1019,21 +1023,24 @@ def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> list:
             if len(numeros_parte_posibles) > 5:
                 numeros_str += f" (y {len(numeros_parte_posibles)-5} más)"
 
-            #  IMPORTANTE: Registrar en CSV ANTES de retornar
-            log.info(f"📝 Registrando en CSV: MDI={mdi}, números={numeros_str}")
-            registrar_error_validacion(estacion, f"MDI={mdi}: {numeros_str}", "NUMEROS_NO_VALIDOS_ESTACION")
+            log.warning(f"⚠️ Ningún número válido para estacion: MDI={mdi}, números={numeros_str}")
+            res = ([], "NUMEROS_NO_VALIDOS_ESTACION_SQL")
+            validacion_estampado_cache[cache_key] = res
+            return res
 
     except Exception as e:
         log.error(f"❌ Error validando en SQL Server para MDI={mdi}: {e}")
-        return []
+        # En caso de error de conexión o consulta, no bloquear AS400
+        return ([], "ERROR_CONSULTA_SQL_SERVER")
     finally:
         # NOTA: No cerramos la conexión aquí, el pool la maneja
         pass
 
+    res = (numeros_parte_validados, None)
     # Guardar en cache
-    validacion_estampado_cache[cache_key] = numeros_parte_validados
+    validacion_estampado_cache[cache_key] = res
 
-    return numeros_parte_validados
+    return res
 
 # ═══════════════════════════ PATRONES STRATEGY & FACTORY ═══════════════════════════
 
@@ -1090,13 +1097,17 @@ class IPDataCollector:
     def _parse_tag(self, tag_name):
         """Detecta tipo y grupo del tag (ej: 'Contador RH' -> 'contador', 'RH')"""
         lower = tag_name.lower()
-        parts = tag_name.split()
+        upper = tag_name.upper()
 
         grupo = "GLOBAL"
-        if len(parts) > 1:
-            possible_suffix = parts[-1].upper()
-            if possible_suffix in ['LH', 'RH', 'LH REAR', 'RH REAR']:
-                grupo = possible_suffix
+        if upper.endswith("LH REAR"):
+            grupo = "LH REAR"
+        elif upper.endswith("RH REAR"):
+            grupo = "RH REAR"
+        elif upper.endswith("LH"):
+            grupo = "LH"
+        elif upper.endswith("RH"):
+            grupo = "RH"
 
         tipo = "otro"
         if "contador" in lower: tipo = "contador"
@@ -1150,7 +1161,7 @@ class IPDataCollector:
                 mdi = partes['orig'].strip()
 
                 # Validar números de parte usando la nueva función
-                numeros_validados = validar_numeros_parte_estampado(mdi, estacion, log)
+                numeros_validados, error_reason = validar_numeros_parte_estampado(mdi, estacion, log)
 
                 #  NUEVO: Logging detallado de lo que se encontró
                 log.info(f"📦 Procesando estampado: MDI={mdi}, estacion={estacion}")
@@ -1166,7 +1177,8 @@ class IPDataCollector:
                             'contador': data['contador'],
                             'tiempo': data.get('tiempo', 0.0),
                             'troquel_id': troquel_id,
-                            'validado': True
+                            'validado': True,
+                            'lado': grp  # 🆕 Identificar el lado/grupo
                         })
                     log.info(f"✅ Agregados {len(numeros_validados)} números de parte validados a datos_estacion")
                 else:
@@ -1174,9 +1186,7 @@ class IPDataCollector:
                     log.warning(f"❌ No se encontraron números válidos para MDI={mdi}")
                     log.warning(f"   Se agregará como NO VALIDADO para que aparezca en la interfaz")
 
-                    #  IMPORTANTE: Registrar en CSV cuando no hay números validados
-                    # Esto es adicional al registro que ya se hace en validar_numeros_parte_estampado
-                    registrar_error_validacion(estacion, partes['orig'], "NO_PART_NUMBER_ESTAMPADO")
+                    error_msg = error_reason if error_reason else 'NO_PART_NUMBER_ESTAMPADO'
 
                     datos_estacion.append({
                         'parte': None,
@@ -1185,7 +1195,8 @@ class IPDataCollector:
                         'tiempo': data.get('tiempo', 0.0),
                         'troquel_id': troquel_id,
                         'validado': False,
-                        'error_validacion': 'NO_PART_NUMBER_ESTAMPADO'
+                        'error_validacion': error_msg,
+                        'lado': grp  # 🆕 Identificar el lado/grupo
                     })
             else:
                 # Para otras áreas, mantener el comportamiento original
@@ -1194,13 +1205,15 @@ class IPDataCollector:
                         if not p_nombre:
                             continue
                         datos_estacion.append({
-                            'parte': p_nombre,
-                            'original': partes['orig'],
-                            'contador': data['contador'],
-                            'tiempo': data.get('tiempo', 0.0),
-                            'troquel_id': troquel_id,
-                            'validado': True
-                        })
+                        'parte': p_nombre,
+                        'original': partes['orig'],
+                        'contador': data['contador'],
+                        'tiempo': data.get('tiempo', 0.0),
+                        'troquel_id': troquel_id,
+                        'validado': None,  # ⏳ Era True, se forzó a None para requerir validación DB
+                        'error_validacion': None,
+                        'lado': grp  # 🆕 Identificar el lado/grupo
+                    })
                 elif partes['orig'] and partes['orig'].strip():
                     datos_estacion.append({
                         'parte': None,
@@ -1209,7 +1222,8 @@ class IPDataCollector:
                         'tiempo': data.get('tiempo', 0.0),
                         'troquel_id': troquel_id,
                         'validado': False,
-                        'error_validacion': 'NO_PART_NUMBER'
+                        'error_validacion': 'NO_PART_NUMBER',
+                        'lado': grp  # 🆕 Identificar el lado/grupo
                     })
 
         return datos_estacion
@@ -1238,17 +1252,48 @@ class IPDataCollector:
                     })
 
 
-                    last = datos_estacion[0]
+
+                    # 🆕 Actualizar system_monitor con TODOS los lados
                     if est in system_monitor['estaciones']:
-                        status_validacion = " ✅" if last.get('validado', True) else " ⚠️"
+                        # Inicializar estructura de lados si no existe
+                        if 'lados' not in system_monitor['estaciones'][est]:
+                            system_monitor['estaciones'][est]['lados'] = {}
+                        
+                        # Actualizar CADA lado detectado
+                        for dato in datos_estacion:
+                            lado = dato.get('lado', 'GLOBAL')
+                            
+                            validado_flag = dato.get('validado')
+                            error_val = dato.get('error_validacion')
+
+                            # 🚀 PRESERVAR ESTADO VISUAL SI ES EL MISMO NÚMERO
+                            if validado_flag is None:
+                                if est in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][est] and lado in system_monitor['estaciones'][est]['lados']:
+                                    prev_ui_state = system_monitor['estaciones'][est]['lados'][lado]
+                                    prev_parte_original = prev_ui_state.get('parte_actual', '').split(' ')[0]
+                                    if prev_parte_original == dato['original']:
+                                        validado_flag = prev_ui_state.get('validado')
+                                        error_val = prev_ui_state.get('error_validacion')
+
+                            if validado_flag is None:
+                                status_validacion = " ⏳"
+                            elif validado_flag is True:
+                                status_validacion = " ✅"
+                            else:
+                                status_validacion = " ❌"
+                            
+                            system_monitor['estaciones'][est]['lados'][lado] = {
+                                'parte_actual': dato['original'] + status_validacion,
+                                'contador': dato['contador'],
+                                'tiempo_ciclo': dato['tiempo'],
+                                'validado': validado_flag,
+                                'error_validacion': error_val
+                            }
+                        
+                        # Actualizar info general de la estación
                         system_monitor['estaciones'][est].update({
-                            'parte_actual': last['original'] + status_validacion,
-                            'contador': last['contador'],
-                            'tiempo_ciclo': last['tiempo'],
                             'ultima_actualizacion': now,
                             'ip': self.ip,
-                            'validado': last.get('validado', True),
-                            'error_validacion': last.get('error_validacion', None)
                         })
                 else:
                     batch.append({
@@ -1279,6 +1324,7 @@ class IPDataProcessor:
     def __init__(self, ip):
         self.ip = ip
         self.active_records = {}
+        self.last_scanned_parts = {}  # 🆕 Polling optimization cache
         self.state_file = STATE_DIR / f"state_{self.ip.replace('.', '_')}.json"
         self.load_state()
 
@@ -1296,6 +1342,10 @@ class IPDataProcessor:
                     h_str = record.get('hora_cambio', '00:00:00')
                     h_obj = datetime.strptime(h_str, "%H:%M:%S").time()
                     record['hora_cambio'] = h_obj
+
+                    # 🛡️ MIGRACIÓN DE JSON ANTIGUO: Añadir '_GLOBAL' si la llave no tiene lado
+                    if not any(clave.endswith(suf) for suf in ['_GLOBAL', '_RH', '_LH', '_RH REAR', '_LH REAR', '_--']):
+                        clave = f"{clave}_GLOBAL"
 
                     #  RESTAURAR número original desde el estado
                     if 'numero_original' not in record:
@@ -1328,6 +1378,134 @@ class IPDataProcessor:
                 json.dump(serializable_data, f, indent=4)
         except Exception as e:
             logger.error(f"Error guardando estado para {self.ip}: {e}")
+
+    def _ensure_active_record(self, cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, force_offset=None, lado='--'):
+        """
+        Garantiza que exista un registro activo (Status 7) para la estación y parte.
+        Hybrid Logic:
+        - Normal (force_offset=None): Offset=0 (Absolute).
+        - Shift Change (force_offset=X): Offset=X (Relative).
+        """
+        id_reg, q_plan, q_prod, status, prod_start_db, mult = obtener_id_registro_activo(
+            cursor, estacion, fecha_plan, turno, num, log
+        )
+        
+        mult = mult or 1
+        
+        # Lógica de Offset y Recuperación
+        # Si ya existe registro con producción, el offset original debió ser (cnt_actual - produccion / mult)
+        # Esto asume que NO hubo resets intermedios. Si hubo, el offset recuperado será aproximado al último reset.
+        # Para mayor precisión en reinicios, idealmente el JSON persiste. Esto es el fallback.
+        offset_calculado = 0
+        corrida_previa_recuperada = 0
+
+        #  NUEVO: Lógica de recuperación ajustada para Lados Compartidos
+        # Si compartimos ID con otro lado, la producción DB será la SUMA total.
+        # No podemos usar production_actual_db para calcular MI offset individual confiablemente.
+        # SOLUCIÓN: Si es una recuperación desde cero (sin JSON), asumimos Offset=0 (Absoluto) o Offset=Cnt (Relativo)
+        # dependiendo de la política. Por seguridad en fallo eléctrico, intentamos recuperar lo que podemos.
+        
+        if id_reg and (q_prod or 0) > 0:
+            # Recuperación Inversa: Offset = PLC_Actual - Producción_DB
+            # Nota: Si hubo resets, esto nos da el "Offset Efectivo" actual.
+            produccion_actual_db = q_prod or 0
+            
+            #  ADVERTENCIA: Si hay otro lado sumando, produccion_actual_db > mi_produccion.
+            # Esto haría que (prod_db / mult) sea grande y el offset calculado sea muy pequeño o negativo.
+            # Si el offset calculado es negativo, es señal clara de que hay otro lado aportando.
+            # En ese caso, la recuperación inversa NO ES FIABLE para separar lados.
+            # FALLBACK: Si no hay JSON, asumir Offset=0 (conteo absoluto del PLC actual)
+            # Esto puede duplicar pocas piezas si el PLC no se reseteó, pero es más seguro que corromper el offset.
+            
+            offset_calculado = 0 # Default seguro
+            
+            # Intento de recuperación inteligente solo si parece razonable (PLC > DB)
+            if cnt * mult >= produccion_actual_db:
+                 offset_calculado = cnt - (produccion_actual_db / mult)
+            else:
+                 # PLC < DB (Reseteo o Múltiples Lados sumando)
+                 log.warning(f"⚠️ Inconsistencia/Lados Múltiples al recuperar {lado}: PLC ({cnt}) < BD ({produccion_actual_db}). Asumiendo Offset=0.")
+                 offset_calculado = 0
+        
+        elif id_reg:
+            # Registro existe pero en 0.
+            offset_calculado = force_offset if force_offset is not None else 0
+
+        # Casos de Retorno (Diccionario de estado)
+        reg_state = {
+            'id_registro': None,
+            'quantity_planeada': 0,
+            'corrida_previa': corrida_previa_recuperada, 
+            'multiplicador': mult,
+            'contador_registro': cnt,
+            'offset_variable': offset_calculado,
+            'hora_cambio': datetime.now().time().replace(microsecond=0),
+            'numero_original': num_orig,
+            'lado': lado,  # 🆕 Persistir el lado
+            'necesita_production_start': False,
+            'error_bd': None # 🆕 Para propagar el error de BD
+        }
+
+        # CASO 1: CREAR NUEVO
+        if id_reg is None:
+            # Hybrid Logic Decision:
+            if force_offset is not None:
+                # Caso Cambio de Turno: Relativo al Offset dado
+                offset_calculado = force_offset
+                qty_inicial = (cnt - offset_calculado) * mult 
+            else:
+                # Caso Normal (Parte Nueva): Absoluto
+                offset_calculado = 0
+                if mult == 1: 
+                    mult = obtener_multiplicador_as400(num, estacion, log) or 1
+                qty_inicial = cnt * mult
+
+            id_reg, q_plan, q_prod, mult_new, error_bd = crear_nuevo_registro(
+                cursor, num, estacion, qty_inicial, turno, fecha_fmt, fecha_plan, num_orig, log
+            )
+            
+            if id_reg is None: 
+                reg_state['error_bd'] = error_bd
+                return reg_state
+            
+            reg_state.update({
+                'id_registro': id_reg, 
+                'quantity_planeada': q_plan,
+                'corrida_previa': 0, 
+                'multiplicador': mult_new or mult,
+                'offset_variable': offset_calculado,
+                'necesita_production_start': False  # ✅ Corregido: Ya tiene start del INSERT
+            })
+            return reg_state
+
+        # CASO 2: REACTIVAR (Status 8)
+        if status == 8:
+            try:
+                cursor.execute("UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8", (id_reg,))
+                log.info(f"✅ Registro {id_reg} reactivado (status 8 → 7)")
+            except Exception as e:
+                log.error(f"❌ Error reactivando registro {id_reg}: {e}")
+            
+            reg_state.update({
+                'id_registro': id_reg,
+                'quantity_planeada': q_plan,
+                'multiplicador': mult,
+                'offset_variable': offset_calculado, # Asegurar que el offset se propague
+                'necesita_production_start': False
+            })
+            return reg_state
+
+        # CASO 3: ACTIVO
+        if prod_start_db is None and status == 3:
+            reg_state['necesita_production_start'] = True
+            
+        reg_state.update({
+            'id_registro': id_reg,
+            'quantity_planeada': q_plan,
+            'multiplicador': mult,
+            'offset_variable': offset_calculado, # Asegurar que el offset se propague
+        })
+        return reg_state
 
     async def process_continuously(self):
         if self.ip not in ip_data_queues: return
@@ -1410,10 +1588,13 @@ class IPDataProcessor:
                 claves_actuales_en_plc = set()
                 for d in datos:
                     if d['parte']:  # Solo agregar si tiene parte válida
-                        claves_actuales_en_plc.add(f"{estacion}_{d['parte']}")
+                        # 🆕 CLAVE ÚNICA POR LADO: estacion_parte_lado
+                        lado = d.get('lado', '--')
+                        claves_actuales_en_plc.add(f"{estacion}_{d['parte']}_{lado}")
 
                 claves_obsoletas = []
                 for k in self.active_records:
+                    # 🆕 Verificar prefijo y ausencia en claves actuales
                     if k.startswith(f"{estacion}_") and k not in claves_actuales_en_plc:
                         claves_obsoletas.append(k)
 
@@ -1437,94 +1618,61 @@ class IPDataProcessor:
                     cnt = d['contador']
                     tiempo = d['tiempo']
                     troquel_id = d.get('troquel_id')
-                    validado = d.get('validado', True)
+                    
+                    lado_actual = d.get('lado', '--')
+                    cache_key = f"{estacion}_{lado_actual}"
+                    current_state = {"parte_original": num_orig, "contador": cnt}
+                    previous_state = self.last_scanned_parts.get(cache_key)
+
+                    # 🚀 OPTIMIZACIÓN DE POLLEO: Si la pieza y contador son idénticos al milisegundo anterior, saltamos validación SQL
+                    if previous_state and previous_state["parte_original"] == num_orig and previous_state["contador"] == cnt:
+                        continue  # El UI ya preservó el estado visual, evitamos saturar SQL Server y CSVs
+
+                    # Si es nuevo o ha cambiado, actualizamos nuestro caché antes del procesamiento pesado
+                    self.last_scanned_parts[cache_key] = current_state
+                    validado = d.get('validado')
                     error_val = d.get('error_validacion', None)
 
-                    if not validado:
-                        log.warning(f"⚠️ Número de parte NO VALIDADO: {num_orig} - Error: {error_val}")
+                    if validado is False:
+                        log.warning(f"⚠️ Número de parte NO VALIDADO (previamente): {num_orig} - Error: {error_val}")
 
                         #  CRÍTICO: Registrar en CSV ANTES de hacer continue
                         if error_val:
                             log.info(f"📝 Registrando error en CSV: estacion={estacion}, num_orig={num_orig}, error={error_val}")
                             registrar_error_validacion(estacion, num_orig, error_val)
+                            
+                        # El UI ya fue actualizado a ❌ en collect_and_enqueue por Estampado
 
                         continue
 
-                    clave = f"{estacion}_{num}"
+                    clave = f"{estacion}_{num}_{d.get('lado', '--')}"  # 🆕 CLAVE POR LADO
 
                     if clave not in self.active_records:
-                        id_reg, q_plan, q_prod, status, prod_start_db, mult = obtener_id_registro_activo(
-                            cursor, estacion, fecha_plan, turno, num, log
-                        )
-
-                        corrida_previa = 0
-                        necesita_production_start = False
-
-                        # CASO 1: No hay registro en BD → CREAR NUEVO
-                        if id_reg is None:
-                            id_reg, q_plan, q_prod, mult = crear_nuevo_registro(
-                                cursor, num, estacion, 0, turno, fecha_fmt, fecha_plan, num_orig, log
-                            )
-                            if id_reg is None:
-                                continue
-                            # Nuevo registro necesita production_start
-                            necesita_production_start = True
-                            #  CAMBIO: Para registro NUEVO, cnt_turn_start = cnt (0 diferencia)
-                            cnt_turn_start = 0
-
-                        # CASO 2: Hay registro con status 8 → USAR EL MISMO
-                        elif status == 8:
-                            #  CAMBIO IMPORTANTE: Guardar producción anterior en corrida_previa
-                            corrida_previa = q_prod or 0
-                            log.info(f"📥 Registro terminado (status 8) ID {id_reg} con {corrida_previa} piezas ya producidas")
-
-                            # Reactivar registro (8 → 7)
-                            try:
-                                cursor.execute(
-                                    "UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8",
-                                    (id_reg,)
-                                )
-                                log.info(f"✅ Registro {id_reg} reactivado (status 8 → 7)")
-                            except Exception as e:
-                                log.error(f"❌ Error reactivando registro {id_reg}: {e}")
-
-                            # No necesita production_start porque ya lo tiene
-                            necesita_production_start = False
-                            #  CAMBIO: cnt_turn_start = 0 porque ya tenemos corrida_previa
-                            cnt_turn_start = 0
-
-                        # CASO 3: Hay registro ACTIVO (status 3 o 7) → USAR NORMALMENTE
-                        else:
-                            # Status 3 (pendiente) o 7 (produciendo)
-                            if prod_start_db is None and status == 3:
-                                # Registro pendiente sin fecha de inicio
-                                necesita_production_start = True
-                                log.info(f"🔄 Registro activo sin production_start. Se establecerá en primera actualización")
-
-                            #  CAMBIO IMPORTANTE: Si ya hay producción, usarla como corrida_previa
-                            if (q_prod or 0) > 0:
-                                corrida_previa = q_prod
-                                cnt_turn_start = 0  # Ya hay producción acumulada
-                                log.info(f"📋 Registro activo con {corrida_previa} piezas ya producidas")
-                            else:
-                                cnt_turn_start = 0  # No hay producción previa
-                                log.info(f"📋 Registro activo sin producción previa")
-
-                            log.info(f"📋 Registro activo ID {id_reg} con status {status}")
-
-                        mult = mult or 1
-
-                        self.active_records[clave] = {
-                            'id_registro': id_reg,
-                            'quantity_planeada': q_plan,
-                            'corrida_previa': corrida_previa,
-                            'multiplicador': mult,
-                            'contador_registro': cnt,
-                            'cnt_turn_start': cnt_turn_start,  #  SOLO para cambio de turno
-                            'hora_cambio': hora,
-                            'numero_original': num_orig,
-                            'necesita_production_start': necesita_production_start
-                        }
+                        new_record = self._ensure_active_record(cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, lado=d.get('lado', '--'))
+                        
+                        if new_record and new_record.get('error_bd'):
+                            error_bd = new_record['error_bd']
+                            log.warning(f"⚠️ Número de parte RECHAZADO EN BD: {num_orig} - Error: {error_bd}")
+                            registrar_error_validacion(estacion, num_orig, error_bd)
+                            
+                            lado_actual = d.get('lado', 'GLOBAL')
+                            if estacion in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][estacion]:
+                                if lado_actual in system_monitor['estaciones'][estacion]['lados']:
+                                    system_monitor['estaciones'][estacion]['lados'][lado_actual]['parte_actual'] = f"{num_orig} ❌"
+                                    system_monitor['estaciones'][estacion]['lados'][lado_actual]['validado'] = False
+                            continue
+                        
+                        if not new_record or new_record.get('id_registro') is None:
+                             continue
+                        
+                        # Si llegamos aquí, el registro se creó bien, la parte SÍ es válida en DB
+                        lado_actual = d.get('lado', 'GLOBAL')
+                        if estacion in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][estacion]:
+                            if lado_actual in system_monitor['estaciones'][estacion]['lados']:
+                                system_monitor['estaciones'][estacion]['lados'][lado_actual]['parte_actual'] = f"{num_orig} ✅"
+                                system_monitor['estaciones'][estacion]['lados'][lado_actual]['validado'] = True
+                             
+                        self.active_records[clave] = new_record
                         state_changed = True
 
                     reg = self.active_records[clave]
@@ -1544,118 +1692,75 @@ class IPDataProcessor:
                         except Exception as e:
                             log.error(f"Error cerrando registro {old_id}: {e}")
 
-                        # Obtener nuevo turno basado en la hora actual
+                        # Recalcular turno
                         if not SHIFTS_CONFIG:
-                            # Si no hay configuración, usar lógica por defecto
-                            if time(8, 0) <= hora < time(20, 0):
-                                turno = 1
-                            elif hora >= time(20, 0):
-                                turno = 2
-                            else:
-                                turno = 2
+                            if time(8, 0) <= hora < time(20, 0): turno = 1
+                            elif hora >= time(20, 0): turno = 2
+                            else: turno = 2
                         else:
-                            # Usar configuración de turnos para determinar nuevo turno
-                            # Simplemente recalcular el turno actual
                             turno, _ = safe_get_current_shift(hora)
 
-                        # 🔥 REINICIAR para nuevo turno: cnt_turn_start = cnt actual
-                        cnt_turn_start_base = reg.get("contador_registro", cnt)
-
-                        id_reg2, q_plan2, q_prod2, status2, prod_start2, mult2 = obtener_id_registro_activo(
-                            cursor, estacion, fecha_plan, turno, num, log
+                        # Crear NUEVO registro de TURNO
+                        # HYBRID LOGIC: Cambio de turno -> Relativo al contador PREVIO
+                        prev_counter = reg.get('contador_registro', cnt) # Si no hay prev, usa cnt (Offset=Cnt -> 0)
+                        
+                        # Pasar force_offset = prev_counter
+                        new_reg_data = self._ensure_active_record(
+                            cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, 
+                            force_offset=prev_counter
                         )
-
-                        corrida_previa2 = 0
-                        necesita_production_start2 = False
-
-                        # 🔥 CASO 1: No hay registro en BD para el nuevo turno → CREAR NUEVO
-                        if id_reg2 is None:
-                            id_reg2, q_plan2, q_prod2, mult2 = crear_nuevo_registro(
-                                cursor, num, estacion, 0, turno, fecha_fmt, fecha_plan, num_orig, log
-                            )
-                            if id_reg2 is None:
-                                log.error(f"No se pudo crear registro para nuevo turno: {num}")
-                                continue
-                            # Nuevo registro necesita production_start
-                            necesita_production_start2 = True
-                            cnt_turn_start2 = cnt  # Iniciar desde el contador actual
-
-                        # 🔥 CASO 2: Hay registro con status 8 → REACTIVAR EL MISMO
-                        elif status2 == 8:
-                            # Guardar producción anterior en corrida_previa2
-                            corrida_previa2 = q_prod2 or 0
-                            log.info(f"📥 Registro terminado (status 8) ID {id_reg2} con {corrida_previa2} piezas ya producidas")
-
-                            # Reactivar registro (8 → 7)
-                            try:
-                                cursor.execute(
-                                    "UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8",
-                                    (id_reg2,)
-                                )
-                                log.info(f"✅ Registro {id_reg2} reactivado (status 8 → 7)")
-                            except Exception as e:
-                                log.error(f"❌ Error reactivando registro {id_reg2}: {e}")
-
-                            # No necesita production_start porque ya lo tiene
-                            necesita_production_start2 = False
-                            # cnt_turn_start2 = cnt (porque ya tenemos corrida_previa2)
-                            cnt_turn_start2 = 0
-
-                        # 🔥 CASO 3: Hay registro ACTIVO (status 3 o 7) → USAR NORMALMENTE
-                        else:
-                            # Status 3 (pendiente) o 7 (produciendo)
-                            if prod_start2 is None and status2 == 3:
-                                # Registro pendiente sin fecha de inicio
-                                necesita_production_start2 = True
-                                log.info(f"🔄 Registro activo sin production_start. Se establecerá en primera actualización")
-
-                            # Si ya hay producción, usarla como corrida_previa2
-                            if (q_prod2 or 0) > 0:
-                                corrida_previa2 = q_prod2
-                                cnt_turn_start2 = 0  # Ya hay producción acumulada
-                                log.info(f"📋 Registro activo con {corrida_previa2} piezas ya producidas")
-                            else:
-                                cnt_turn_start2 = cnt  # No hay producción previa
-                                log.info(f"📋 Registro activo sin producción previa")
-
-                            log.info(f"📋 Registro activo ID {id_reg2} con status {status2}")
-
-                        mult2 = mult2 or 1
-
-                        reg['id_registro'] = id_reg2
-                        reg['quantity_planeada'] = q_plan2
-                        reg['corrida_previa'] = corrida_previa2
-                        reg['multiplicador'] = mult2
-                        reg['hora_cambio'] = hora
-                        reg['cnt_turn_start'] = cnt_turn_start_base  # Nuevo inicio para el turno
-                        reg['necesita_production_start'] = necesita_production_start2
-
+                        
+                        if new_reg_data:
+                            reg.update(new_reg_data)
+                            
                         state_changed = True
 
-                    prev = reg.get("contador_registro", 0)
+                    prev = reg.get("contador_registro", cnt)
 
                     if cnt != prev:
                         multiplicador = reg.get("multiplicador", 1)
-                        corrida_previa = reg.get("corrida_previa", 0)
-
-                        #  CAMBIO IMPORTANTE: Usar cnt_turn_start SOLO para cambio de turno
-                        golpes_turno_acumulados = cnt - reg.get('cnt_turn_start', cnt)
-
-                        if golpes_turno_acumulados <= 0:
-                            log.warning(f"⚠️ Reset o error de contador detectado en {num}: {prev} -> {cnt}. Reestableciendo cnt_turn_start.")
-                            reg["cnt_turn_start"] = cnt
-                            golpes_turno_acumulados = 0
-
-                        prod_turno = golpes_turno_acumulados * multiplicador
-                        #  IMPORTANTE: Sumar corrida_previa que contiene la producción previa
-                        qty_upd = prod_turno + corrida_previa
-
-                        #  DETERMINAR SI NECESITA PRODUCTION_START
+                        
+                        # 🔍 DIAGNÓSTICO: Log de cambio de contador
+                        log.debug(f"📊 Cambio contador en {num}: {prev} → {cnt}")
+                        
+                        # ⚠️ DETECCIÓN DE RESET (Bajada de contador con respecto al OFFSET o PREV?)
+                        # En modelo relativo, el offset es fijo. Solo si CNT baja a menor que Offset, o hubo un salto extraño.
+                        # Pero el reset clásico es que CNT se va a 0.
+                        offset = reg.get('offset_variable', 0)
+                        
+                        if cnt < prev: # Bajada detectada
+                            log.warning(f"⚠️ Reset detectado en {num}: {prev} -> {cnt}. Offset era {offset}")
+                            
+                            # Producción lograda hasta antes del reset con el offset viejo
+                            # Prod_Tramo = (Prev - Offset) * Mult
+                            # Esto se suma a corrida_previa
+                            if prev >= offset:
+                                lost_production_tramo = (prev - offset) * multiplicador
+                                reg['corrida_previa'] = reg.get('corrida_previa', 0) + lost_production_tramo
+                                log.info(f"   Acumulado {lost_production_tramo} a corrida_previa.")
+                            
+                            # Nuevo Offset: 0 (o el nuevo cnt si asumimos que reinició ahi)
+                            reg['offset_variable'] = 0
+                            offset = 0 # Actualizar localmente para el calculo abajo
+                        
+                        # MODELO RELATIVO ROBUSTO:
+                        # Producción = ((PLC - Offset) * Multi) + Corrida_Previa
+                        # Nota: Si PLC < Offset (ej. después de reset mal detectado), esto daría negativo.
+                        # Protección básica:
+                        if cnt >= offset:
+                            prod_tramo_actual = (cnt - offset) * multiplicador
+                        else:
+                            # Caso raro: CNT bajó pero no entró en el if detect de arriba (??) O offset quedó alto.
+                            # Si entramos aquí es que offset > cnt. Asumimos producción 0 del tramo y forzamos reset?
+                            prod_tramo_actual = 0
+                        
+                        prod_absoluta = prod_tramo_actual + reg.get('corrida_previa', 0)
+                        
                         necesita_start = reg.get('necesita_production_start', False)
 
                         actualizar_registro(
                             cursor,
-                            qty_upd,
+                            prod_absoluta,
                             fecha_fmt,
                             reg['id_registro'],
                             7,
@@ -1665,11 +1770,17 @@ class IPDataProcessor:
 
                         pid = obtener_part_number_id(cursor, num, estacion)
                         if pid:
-                            incremento_ciclo = (cnt - prev)
-                            cantidad_historial = incremento_ciclo * multiplicador
+                            if cnt >= prev:
+                                incremento_ciclo = cnt - prev
+                            else:
+                                incremento_ciclo = cnt # Asumiendo reset a 0
 
+                            cantidad_historial = incremento_ciclo * multiplicador
                             extras = {'troquel_id': troquel_id}
-                            cantidad_history = cnt if "estampado" in str(area).lower() else cantidad_historial
+                            # En area estampado se guarda el valor absoluto del contador en history, en otras el incremento
+                            # cantidad_history = cnt if "estampado" in str(area).lower() else cantidad_historial
+                            # En area estampado guardad el incremento sin multiplicar por el multiplicador
+                            cantidad_history = incremento_ciclo if "estampado" in str(area).lower() else incremento_ciclo
 
                             if cantidad_history > 0:
                                 db_strategy.insertar_history(cursor, pid, cantidad_history, fecha_fmt, tiempo, extras)
@@ -1867,7 +1978,7 @@ async def supervisor():
 
                         proc_task = asyncio.create_task(processor.process_continuously())
                         tasks[f"{ip}_processor"] = proc_task
-
+                    
                     # Crear tarea de lectura
                     reader_task = asyncio.create_task(plc_reader(ip, port, config[ip]))
                     tasks[ip] = reader_task
@@ -1888,7 +1999,16 @@ async def supervisor():
                         tasks[proc_key].cancel()
                         del tasks[proc_key]
 
-            await asyncio.sleep(POLL_INTERVAL)
+            # Espera inteligente (tiempo de poll O evento manual)
+            if global_config_event:
+                try:
+                    await asyncio.wait_for(global_config_event.wait(), timeout=POLL_INTERVAL)
+                    global_config_event.clear()
+                    logger.info("⚡ Actualización de configuración forzada por usuario")
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(POLL_INTERVAL)
 
         except Exception as e:
             logger.error(f"❌ Error en supervisor: {e}")
@@ -1915,6 +2035,7 @@ class ModernDashboardUI:
 
         # Variable para el botón de actualizar turnos
         self.refresh_shifts_btn = None
+        self.refresh_config_btn = None  # 🆕 Inicializar variable
 
         self.build_ui()
         self.update_loop()
@@ -1963,17 +2084,29 @@ class ModernDashboardUI:
         )
         self.lbl_offline.grid(row=0, column=3, padx=20, pady=5, sticky="w")
 
-        # Fila 2: Botón de actualizar turnos y uptime
+        # Fila 2: Botones de actualización
         self.refresh_shifts_btn = ctk.CTkButton(
             stats_container,
             text="🔄 Actualizar Turnos",
             command=self.refresh_shifts,
-            width=200,
-            font=("Arial", 14, "bold"),
+            width=180,
+            font=("Arial", 12, "bold"),
             fg_color="#4CAF50",
             hover_color="#45a049"
         )
-        self.refresh_shifts_btn.grid(row=1, column=0, columnspan=2, padx=20, pady=10, sticky="w")
+        self.refresh_shifts_btn.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+
+        # 🆕 Botón Actualizar Configuración
+        self.refresh_config_btn = ctk.CTkButton(
+            stats_container,
+            text="⚙️ Actualizar Config",
+            command=self.refresh_config,
+            width=180,
+            font=("Arial", 12, "bold"),
+            fg_color="#2196F3",
+            hover_color="#1976D2"
+        )
+        self.refresh_config_btn.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
 
         self.lbl_uptime = ctk.CTkLabel(
             stats_container,
@@ -2018,8 +2151,8 @@ class ModernDashboardUI:
         scrollbar = ctk.CTkScrollbar(tree_frame)
         scrollbar.pack(side="right", fill="y")
 
-        # Definir columnas
-        cols = ("Estación", "Área", "IP", "Parte Original", "Contador", "Estado")
+        # Definir columnas (🆕 Agregada columna "Lado")
+        cols = ("Estación", "Lado", "Área", "IP", "Parte Original", "Contador", "Estado")
 
         # Configurar estilo del Treeview
         style = ttk.Style()
@@ -2050,6 +2183,7 @@ class ModernDashboardUI:
 
         col_widths = {
             "Estación": 200,
+            "Lado": 120,  # 🆕 Ancho para columna Lado
             "Área": 150,
             "IP": 150,
             "Parte Original": 300,
@@ -2131,6 +2265,21 @@ class ModernDashboardUI:
                 vals = self.get_station_values(estacion, info)
                 self.tree.item(self.station_items[estacion], values=vals)
 
+    def refresh_config(self):
+        """Forzar actualización de configuración"""
+        if global_async_loop and global_config_event:
+            self.refresh_config_btn.configure(text="⏳ Actualizando...", state="disabled", fg_color="gray")
+            
+            # Disparar evento en el loop async
+            global_async_loop.call_soon_threadsafe(global_config_event.set)
+            
+            # Restaurar botón visualmente tras breve pausa
+            self.root.after(2000, lambda: self.refresh_config_btn.configure(
+                text="⚙️ Actualizar Config", state="normal", fg_color="#2196F3"
+            ))
+        else:
+            logger.warning("⚠️ No hay loop async disponible para actualizar config")
+
     def get_station_values(self, estacion, info):
         """Obtiene valores formateados para una estación"""
         diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
@@ -2154,18 +2303,21 @@ class ModernDashboardUI:
         )
 
     def filter_stations(self):
-        """Filtrar estaciones por búsqueda"""
+        """Filtrar estaciones por búsqueda y mostrar TODOS los lados"""
         search_text = self.search_var.get().lower()
 
-        #  CAMBIO: No limpiar, solo actualizar items existentes
         items = sorted(system_monitor['estaciones'].items(), key=lambda x: x[0])
+
+        #  Track existing items to avoid rebuilding entire tree
+        seen_items = set()
 
         for est, info in items:
             if search_text and search_text not in est.lower() and search_text not in info.get('ip', '').lower():
-                # Ocultar item si no coincide con búsqueda
-                if est in self.station_items:
-                    self.tree.delete(self.station_items[est])
-                    del self.station_items[est]
+                # Ocultar items de esta estación si no coincide con búsqueda
+                for key in list(self.station_items.keys()):
+                    if key.startswith(f"{est}_"):
+                        self.tree.delete(self.station_items[key])
+                        del self.station_items[key]
                 continue
 
             diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
@@ -2173,7 +2325,7 @@ class ModernDashboardUI:
             ip = info.get('ip', '--')
             plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
 
-            #  CAMBIO: Solo OFFLINE cuando no hay conexión con PLC
+            #  Status basado en conexión PLC
             if not plc_connected:
                 status = "🔴 PLC OFFLINE"
             elif diff < 60:
@@ -2181,21 +2333,61 @@ class ModernDashboardUI:
             else:
                 status = "🟡 Sin datos"
 
-            vals = (
-                est,
-                info.get('area', 'N/A'),
-                ip,
-                info.get('parte_actual', '--'),
-                info.get('contador', 0),
-                status
-            )
-
-            #  CAMBIO: Actualizar item existente o crear nuevo
-            if est in self.station_items:
-                self.tree.item(self.station_items[est], values=vals)
+            # 🆕 NUEVO: Obtener todos los lados detectados
+            lados_data = info.get('lados', {})
+            
+            # Si no hay lados, mostrar info general (backward compatibility)
+            if not lados_data:
+                key = f"{est}_NO_SIDE"
+                vals = (
+                    est,
+                    "--",  # Lado (sin configurar)
+                    info.get('area', 'N/A'),
+                    ip,
+                    info.get('parte_actual', '--'),
+                    info.get('contador', 0),
+                    status
+                )
+                
+                if key in self.station_items:
+                    self.tree.item(self.station_items[key], values=vals)
+                else:
+                    item_id = self.tree.insert("", "end", values=vals)
+                    self.station_items[key] = item_id
+                seen_items.add(key)
             else:
-                item_id = self.tree.insert("", "end", values=vals)
-                self.station_items[est] = item_id
+                # 🆕 Mostrar UN LADO POR FILA, agrupados por estación
+                first_lado = True
+                for lado, lado_info in sorted(lados_data.items()):
+                    key = f"{est}_{lado}"
+                    
+                    # 🎨 Agrupación visual: Mostrar estación solo en la primera fila
+                    estacion_display = est if first_lado else ""
+                    
+                    vals = (
+                        estacion_display,  # 🎯 Vacío para las filas siguientes
+                        lado,              # LH, RH, etc.
+                        info.get('area', 'N/A'),
+                        ip,
+                        lado_info.get('parte_actual', '--'),
+                        lado_info.get('contador', 0),
+                        status
+                    )
+                    
+                    if key in self.station_items:
+                        self.tree.item(self.station_items[key], values=vals)
+                    else:
+                        item_id = self.tree.insert("", "end", values=vals)
+                        self.station_items[key] = item_id
+                    
+                    seen_items.add(key)
+                    first_lado = False
+
+        # Limpiar items que ya no existen
+        for key in list(self.station_items.keys()):
+            if key not in seen_items:
+                self.tree.delete(self.station_items[key])
+                del self.station_items[key]
 
     def update_loop(self):
         n_ips = sum(1 for ip in system_monitor['ips'].values() if ip.get('conectado'))
@@ -2251,6 +2443,17 @@ def start_async():
     """Inicia el loop asyncio con manejo de errores mejorado"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # 🆕 Inicializar variables globales de control
+    global global_async_loop, global_config_event
+    global_async_loop = loop
+    
+    # Crear evento thread-safe
+    async def setup_event():
+        global global_config_event
+        global_config_event = asyncio.Event()
+    
+    loop.run_until_complete(setup_event())
 
     #  CONFIGURAR MANEJADOR DE EXCEPCIONES NO CAPTURADAS
     def handle_exception(loop, context):
