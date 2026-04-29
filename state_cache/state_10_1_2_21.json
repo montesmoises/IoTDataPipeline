@@ -1,0 +1,28 @@
+{
+    "MT04_DGH95483XA_RH": {
+        "id_registro": 80677,
+        "quantity_planeada": 0,
+        "corrida_previa": 0,
+        "multiplicador": 1,
+        "contador_registro": 82,
+        "offset_variable": 0,
+        "hora_cambio": "13:48:06",
+        "numero_original": "DGH9 54 83 XA/ZA",
+        "lado": "RH",
+        "necesita_production_start": false,
+        "error_bd": null
+    },
+    "MT04_DGH95483ZA_RH": {
+        "id_registro": 80678,
+        "quantity_planeada": 0,
+        "corrida_previa": 0,
+        "multiplicador": 1,
+        "contador_registro": 82,
+        "offset_variable": 0,
+        "hora_cambio": "13:48:06",
+        "numero_original": "DGH9 54 83 XA/ZA",
+        "lado": "RH",
+        "necesita_production_start": false,
+        "error_bd": null
+    }
+}

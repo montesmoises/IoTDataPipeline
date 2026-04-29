@@ -65,7 +65,7 @@ logger.addHandler(console_handler)
 station_loggers = {}
 
 # Intervalo (en segundos) para volver a leer la configuración de la BD
-POLL_INTERVAL = 60  # 🚀 Aumentado a 60s (se puede forzar update manual)
+POLL_INTERVAL = 300  # 🚀 Aumentado a 300s (se puede forzar update manual)
 
 # Variables globales para control de actualización manual
 global_async_loop = None
@@ -640,7 +640,7 @@ def obtener_multiplicador_as400(numero_parte: str, estacion: str, estacion_logge
 
         try:
             cursor = conn_as400.cursor()
-            sql = "SELECT I.IUFD11 FROM LX834F01.IIU AS I WHERE RTRIM(I.IUPROD) = ? AND I.IUSEQN = 1"
+            sql = "SELECT I.IUFD11 FROM LX834F01.IIU AS I WHERE RTRIM(I.IUPROD) = ? AND I.IUSEQN = 2"
             cursor.execute(sql, (numero_parte,))
             result = cursor.fetchone()
 
@@ -700,6 +700,9 @@ def load_config():
         global system_monitor
 
         for wc, ip, tag, addr, lng, area in rows:
+            if not ip or not ip.strip():
+                continue
+            
             if area:
                 ip_groups[ip]['area'] = area
 
@@ -723,7 +726,8 @@ def load_config():
                     "address": addr,
                     "long": int(lng)
                 }
-                ip_groups[ip]['all_addresses'].update(expand_block(addr, int(lng)))
+                # NUEVO: Guardar como bloque en lugar de romper direcciones en individuales
+                ip_groups[ip]['all_addresses'].add((addr, int(lng)))
 
             if wc not in ip_groups[ip]['estaciones']:
                 ip_groups[ip]['estaciones'].append(wc)
@@ -1086,6 +1090,35 @@ class DBStrategyFactory:
         else:
             return DefaultStrategy(logger)
 
+# ═══════════════════════════ 🆕 FUNCIÓN: DIVISIÓN DE NÚMERO DE PARTE CON DIAGONAL ═══════════════════════════
+
+def procesar_numero_parte(numero_plc: str) -> list:
+    """
+    Divide un número de parte que contiene diagonal (/) en múltiples combinaciones.
+
+    Ejemplo:
+        "DGH9 53 83 XA/ZA"  →  ["DGH95383XA", "DGH95383ZA"]
+        "ABC 12/34 XY/ZZ"   →  ["ABC12XY", "ABC12ZZ", "ABC34XY", "ABC34ZZ"]
+        "DGH95383XA"        →  ["DGH95383XA"]  (sin diagonal, retorna tal cual)
+
+    Args:
+        numero_plc: Número de parte crudo recibido del PLC
+
+    Returns:
+        Lista de números de parte expandidos
+    """
+    # Dividir por espacios, luego cada segmento por "/"
+    partes = [parte.split('/') for parte in numero_plc.strip().split(' ') if parte]
+
+    # Generar todas las combinaciones (producto cartesiano)
+    combinaciones = [''.join(combinacion) for combinacion in product(*partes)]
+
+    # Insertar espacio antes de guion que no tenga espacio previo (ej: "A-B" → "A -B")
+    combinaciones_modificadas = [re.sub(r'(?<!\s)-', r' -', comb) for comb in combinaciones]
+
+    return combinaciones_modificadas
+
+
 # ═══════════════════════════ RECOLECTOR DINÁMICO ═══════════════════════════
 
 class IPDataCollector:
@@ -1093,6 +1126,7 @@ class IPDataCollector:
         self.ip = ip
         self.estaciones = estaciones
         self.area = area
+        self._last_good_data = {}  # ⚠️ Último dato válido por estación (fallback ante lecturas corruptas)
 
     def _parse_tag(self, tag_name):
         """Detecta tipo y grupo del tag (ej: 'Contador RH' -> 'contador', 'RH')"""
@@ -1117,15 +1151,81 @@ class IPDataCollector:
 
         return tipo, grupo
 
-    def _process_station_data(self, estacion, cfg, val_map, timestamp):
-        """Procesa datos de una estación específica"""
+    def _merge_blocks(self, blocks, max_gap=15):
+        import re
+        from collections import defaultdict
+        parsed_blocks = defaultdict(list)
+        for addr, lng in blocks:
+            match = re.match(r'^([A-Za-z]+)(\d+|[0-9A-Fa-f]+)$', addr)
+            if not match:
+                parsed_blocks[f"UNKNOWN_{addr}"].append({'start': 0, 'len': lng, 'orig': (addr, lng)})
+                continue
+            prefix, num_str = match.groups()
+            prefix = prefix.upper()
+            base = 16 if prefix in ['W', 'B', 'X', 'Y'] else 10
+            start = int(num_str, base)
+            parsed_blocks[f"{prefix}_{base}"].append({'start': start, 'len': lng, 'orig': (addr, lng)})
+
+        merged_requests = []
+        for group_key, items in parsed_blocks.items():
+            if group_key.startswith("UNKNOWN_"):
+                for item in items:
+                    merged_requests.append({
+                        'head': item['orig'][0], 'len': item['orig'][1], 
+                        'sub_blocks': [{'orig': item['orig'], 'offset': 0}]
+                    })
+                continue
+            
+            items.sort(key=lambda x: x['start'])
+            current = None
+            for item in items:
+                if current is None:
+                    current = {
+                        'head': item['orig'][0], 'start': item['start'], 'end': item['start'] + item['len'] - 1,
+                        'sub_blocks': [{'orig': item['orig'], 'offset': 0}]
+                    }
+                else:
+                    gap = item['start'] - current['end'] - 1
+                    new_end = max(current['end'], item['start'] + item['len'] - 1)
+                    total_len = new_end - current['start'] + 1
+                    
+                    if gap <= max_gap and gap >= 0 and total_len <= 960:
+                        current['end'] = new_end
+                        current['sub_blocks'].append({'orig': item['orig'], 'offset': item['start'] - current['start']})
+                    elif item['start'] <= current['end']:
+                        current['end'] = new_end
+                        current['sub_blocks'].append({'orig': item['orig'], 'offset': item['start'] - current['start']})
+                    else:
+                        merged_requests.append({
+                            'head': current['head'], 'len': current['end'] - current['start'] + 1,
+                            'sub_blocks': current['sub_blocks']
+                        })
+                        current = {
+                            'head': item['orig'][0], 'start': item['start'], 'end': item['start'] + item['len'] - 1,
+                            'sub_blocks': [{'orig': item['orig'], 'offset': 0}]
+                        }
+            if current is not None:
+                merged_requests.append({
+                    'head': current['head'], 'len': current['end'] - current['start'] + 1,
+                    'sub_blocks': current['sub_blocks']
+                })
+        return merged_requests
+
+    def _process_station_data(self, estacion, cfg, block_data, timestamp):
+        """Procesa datos de una estación específica obtenida de los bloques"""
         from collections import defaultdict
 
         groups_data = defaultdict(dict)
 
         for tag_name, info in cfg.items():
             tipo, grupo = self._parse_tag(tag_name)
-            block_vals = [val_map.get(a, 0) for a in expand_block(info['address'], info['long'])]
+            
+            addr, lng = info['address'], info['long']
+            # ⚠️ Si el bloque es None (lectura fallida), abortar toda la estación
+            block_vals = block_data.get((addr, lng), [0] * lng)
+            if block_vals is None:
+                logger.warning(f"⛔ Bloque {addr} inválido para {estacion} — descartando lectura completa para evitar datos corruptos.")
+                return None  # Señal de lectura inválida
 
             val = None
             if tipo == "contador":
@@ -1199,48 +1299,117 @@ class IPDataCollector:
                         'lado': grp  # 🆕 Identificar el lado/grupo
                     })
             else:
-                # Para otras áreas, mantener el comportamiento original
-                if partes['list']:
+                # 🆕 Para otras áreas: detectar diagonal y expandir número de parte
+                parte_orig_limpia = partes['orig'].strip() if partes['orig'] else ''
+                data_contador = data['contador']
+
+                if parte_orig_limpia and '/' in parte_orig_limpia:
+                    # ── Tiene diagonal → expandir con procesar_numero_parte ──
+                    log.info(f"🔀 Diagonal detectada en '{parte_orig_limpia}' — expandiendo combinaciones")
+                    numeros_expandidos = procesar_numero_parte(parte_orig_limpia)
+                    log.info(f"   Combinaciones generadas: {numeros_expandidos}")
+
+                    if numeros_expandidos:
+                        for num in numeros_expandidos:
+                            if not num:
+                                continue
+                            datos_estacion.append({
+                                'parte': num,
+                                'original': parte_orig_limpia,
+                                'contador': data_contador,
+                                'tiempo': data.get('tiempo', 0.0),
+                                'troquel_id': troquel_id,
+                                'validado': None,  # Se validará contra BD en ensure_active_record
+                                'error_validacion': None,
+                                'lado': grp
+                            })
+                        log.info(f"✅ {len(numeros_expandidos)} números expandidos agregados a datos_estacion")
+                    else:
+                        log.warning(f"❌ procesar_numero_parte no generó combinaciones para '{parte_orig_limpia}'")
+                        datos_estacion.append({
+                            'parte': None,
+                            'original': parte_orig_limpia,
+                            'contador': data_contador,
+                            'tiempo': data.get('tiempo', 0.0),
+                            'troquel_id': troquel_id,
+                            'validado': False,
+                            'error_validacion': 'NO_PART_NUMBER',
+                            'lado': grp
+                        })
+
+                elif partes['list']:
+                    # ── Sin diagonal → comportamiento original ──
                     for p_nombre in partes['list']:
                         if not p_nombre:
                             continue
                         datos_estacion.append({
-                        'parte': p_nombre,
-                        'original': partes['orig'],
-                        'contador': data['contador'],
-                        'tiempo': data.get('tiempo', 0.0),
-                        'troquel_id': troquel_id,
-                        'validado': None,  # ⏳ Era True, se forzó a None para requerir validación DB
-                        'error_validacion': None,
-                        'lado': grp  # 🆕 Identificar el lado/grupo
-                    })
-                elif partes['orig'] and partes['orig'].strip():
+                            'parte': p_nombre,
+                            'original': partes['orig'],
+                            'contador': data_contador,
+                            'tiempo': data.get('tiempo', 0.0),
+                            'troquel_id': troquel_id,
+                            'validado': None,
+                            'error_validacion': None,
+                            'lado': grp
+                        })
+
+                elif parte_orig_limpia:
+                    # ── Sin lista válida ni diagonal → marcar como no encontrado ──
                     datos_estacion.append({
                         'parte': None,
-                        'original': partes['orig'],
-                        'contador': data['contador'],
+                        'original': parte_orig_limpia,
+                        'contador': data_contador,
                         'tiempo': data.get('tiempo', 0.0),
                         'troquel_id': troquel_id,
                         'validado': False,
                         'error_validacion': 'NO_PART_NUMBER',
-                        'lado': grp  # 🆕 Identificar el lado/grupo
+                        'lado': grp
                     })
 
         return datos_estacion
 
-    async def collect_and_enqueue(self, plc, group_info, addrs):
-        """Método optimizado para lectura PLC"""
+    async def collect_and_enqueue(self, plc, group_info, blocks):
+        """Método ultra optimizado con lectura Merge-BatchRead"""
         try:
-            # Leer datos del PLC
-            vals, _ = plc.randomread(word_devices=addrs, dword_devices=[])
-            val_map = dict(zip(addrs, vals))
+            merged_reqs = self._merge_blocks(blocks, max_gap=15)
+            
+            block_data = {}
+            for req in merged_reqs:
+                head = req['head']
+                length = req['len']
+                try:
+                    # El PLC soporta batchread_wordunits nativamente. Se leen agrupaciones contiguas.
+                    vals = plc.batchread_wordunits(headdevice=head, readsize=length)
+                    # Desempacar la meta-lectura a sus configuraciones originales
+                    for sub in req['sub_blocks']:
+                        orig_addr, orig_len = sub['orig']
+                        offset = sub['offset']
+                        block_data[sub['orig']] = vals[offset:offset + orig_len]
+                except Exception as batch_error:
+                    # Registrar el error del bloque agrupado
+                    logger.warning(f"Error parcial leyendo macro-bloque {head} (long {length}) en PLC {self.ip}: {batch_error}")
+                    # ⚠️ Marcar este bloque como inválido — NO rellenar con ceros (generan valores basura)
+                    for sub in req['sub_blocks']:
+                        block_data[sub['orig']] = None  # None = lectura fallida
 
             batch = []
             now = datetime.now()
 
             for est in self.estaciones:
                 cfg = group_info['station_configs'].get(est, {})
-                datos_estacion = self._process_station_data(est, cfg, val_map, now)
+                datos_estacion = self._process_station_data(est, cfg, block_data, now)
+
+                # ⚠️ Si la lectura fue inválida (bloque corrupto), usar último dato bueno
+                if datos_estacion is None:
+                    datos_estacion = self._last_good_data.get(est)
+                    if datos_estacion:
+                        logger.warning(f"⚠️ Usando último dato válido para {est} tras lectura corrupta.")
+                    else:
+                        logger.warning(f"⚠️ Sin datos válidos previos para {est} — saltando ciclo.")
+                        continue
+                elif datos_estacion:
+                    # Guardar como último dato bueno
+                    self._last_good_data[est] = datos_estacion
 
                 if datos_estacion:
                     batch.append({
@@ -1270,7 +1439,7 @@ class IPDataCollector:
                             if validado_flag is None:
                                 if est in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][est] and lado in system_monitor['estaciones'][est]['lados']:
                                     prev_ui_state = system_monitor['estaciones'][est]['lados'][lado]
-                                    prev_parte_original = prev_ui_state.get('parte_actual', '').split(' ')[0]
+                                    prev_parte_original = prev_ui_state.get('parte_actual', '').replace(' ⏳', '').replace(' ✅', '').replace(' ❌', '')
                                     if prev_parte_original == dato['original']:
                                         validado_flag = prev_ui_state.get('validado')
                                         error_val = prev_ui_state.get('error_validacion')
@@ -1326,6 +1495,7 @@ class IPDataProcessor:
         self.active_records = {}
         self.last_scanned_parts = {}  # 🆕 Polling optimization cache
         self.state_file = STATE_DIR / f"state_{self.ip.replace('.', '_')}.json"
+        self.ultimo_plcok = {}        # ⏱️ Rastreo de tiempo offline por estación
         self.load_state()
 
     def load_state(self):
@@ -1486,11 +1656,19 @@ class IPDataProcessor:
             except Exception as e:
                 log.error(f"❌ Error reactivando registro {id_reg}: {e}")
             
+            # Al reactivar un registro cerrado (status 8), lo ya producido en BD
+            # se convierte en corrida_previa para no perder esa producción acumulada.
+            # El offset se fija en el contador actual del PLC para contar solo
+            # la producción nueva a partir de este momento.
+            produccion_previa = q_prod or 0
+            log.info(f"♻️ Reactivando {id_reg}: corrida_previa={produccion_previa}, offset nuevo={cnt}")
+
             reg_state.update({
                 'id_registro': id_reg,
                 'quantity_planeada': q_plan,
                 'multiplicador': mult,
-                'offset_variable': offset_calculado, # Asegurar que el offset se propague
+                'offset_variable': cnt,              # Offset = contador actual del PLC
+                'corrida_previa': produccion_previa, # Lo que ya había producido se conserva
                 'necesita_production_start': False
             })
             return reg_state
@@ -1582,8 +1760,29 @@ class IPDataProcessor:
                     return
 
                 if not plc_ok:
-                    log.warning(f"⚠️ PLC desconectado para {estacion}. Manteniendo estado en caché sin cambios.")
-                    return
+                    # ⏱️ Rastrear tiempo de desconexión por estación
+                    if estacion not in self.ultimo_plcok:
+                        self.ultimo_plcok[estacion] = datetime.now()
+                        log.warning(f"⚠️ PLC desconectado para {estacion}. Inicio de desconexión registrado.")
+
+                    tiempo_offline = (datetime.now() - self.ultimo_plcok[estacion]).total_seconds()
+
+                    if tiempo_offline < 30:
+                        # Desconexión breve (<30s): NO cerrar registro, mantener estado congelado
+                        log.warning(f"⚠️ PLC offline {tiempo_offline:.1f}s para {estacion} - manteniendo estado, no cerrando registro.")
+                        return
+                    else:
+                        # Desconexión larga (>=30s): cerrar registro normalmente
+                        log.warning(f"⚠️ PLC offline {tiempo_offline:.1f}s para {estacion} - cerrando registro por desconexión prolongada.")
+                        # Limpiar rastreo para esta estación
+                        self.ultimo_plcok.pop(estacion, None)
+                        return
+                else:
+                    # PLC reconectado: limpiar rastreo de tiempo offline
+                    if estacion in self.ultimo_plcok:
+                        tiempo_offline = (datetime.now() - self.ultimo_plcok[estacion]).total_seconds()
+                        log.info(f"✅ PLC reconectado para {estacion} tras {tiempo_offline:.1f}s offline.")
+                        self.ultimo_plcok.pop(estacion, None)
 
                 claves_actuales_en_plc = set()
                 for d in datos:
@@ -1620,12 +1819,17 @@ class IPDataProcessor:
                     troquel_id = d.get('troquel_id')
                     
                     lado_actual = d.get('lado', '--')
-                    cache_key = f"{estacion}_{lado_actual}"
-                    current_state = {"parte_original": num_orig, "contador": cnt}
+                    # FIX: clave unica por partnumber validado para que cada numero del mismo MDI
+                    # tenga su propio estado de polleo y no sea bloqueado por el "continue"
+                    cache_key = f"{estacion}_{num}_{lado_actual}"
+                    # parte_original guarda el partnumber validado (num), no el MDI,
+                    # para que cada partnumber del mismo MDI tenga estado de polleo independiente
+                    current_state = {"parte_original": num, "contador": cnt}
                     previous_state = self.last_scanned_parts.get(cache_key)
 
                     # 🚀 OPTIMIZACIÓN DE POLLEO: Si la pieza y contador son idénticos al milisegundo anterior, saltamos validación SQL
-                    if previous_state and previous_state["parte_original"] == num_orig and previous_state["contador"] == cnt:
+                    # Optimizacion de polleo: si este partnumber especifico ya fue procesado con este mismo contador, omitir
+                    if previous_state and previous_state["parte_original"] == num and previous_state["contador"] == cnt:
                         continue  # El UI ya preservó el estado visual, evitamos saturar SQL Server y CSVs
 
                     # Si es nuevo o ha cambiado, actualizamos nuestro caché antes del procesamiento pesado
@@ -1960,28 +2164,47 @@ async def supervisor():
 
             ips_actuales = set(config.keys())
 
-            # Iniciar nuevas tareas para IPs que no existen
+            # ⚡ Iniciar o REINICIAR tareas según estado de config por IP
             for ip in ips_actuales:
+                port = config[ip]['port']
+                config_nueva = config[ip]
+
+                # Calcular firma de la config actual para detectar cambios
+                firma_nueva    = str(sorted(config_nueva.get('station_configs', {}).items()))
+                firma_anterior = str(sorted(last_successful_config.get(ip, {}).get('station_configs', {}).items()))
+                config_cambio  = (ip in tasks) and (firma_nueva != firma_anterior)
+
                 if ip not in tasks:
-                    port = config[ip]['port']
+                    # ── IP nueva: arrancar todo desde cero ──
                     logger.info(f"🔌 Iniciando PLC reader para {ip}:{port}")
 
-                    #  CORRECCIÓN CRÍTICA: Crear cola ANTES del procesador
-                    # Esto evita la condición de carrera
                     if ip not in ip_data_queues:
                         ip_data_queues[ip] = asyncio.Queue(maxsize=1000)
 
-                    # Crear procesador y su tarea
                     if ip not in ip_processors:
                         processor = IPDataProcessor(ip)
                         ip_processors[ip] = processor
-
                         proc_task = asyncio.create_task(processor.process_continuously())
                         tasks[f"{ip}_processor"] = proc_task
-                    
-                    # Crear tarea de lectura
-                    reader_task = asyncio.create_task(plc_reader(ip, port, config[ip]))
+
+                    reader_task = asyncio.create_task(plc_reader(ip, port, config_nueva))
                     tasks[ip] = reader_task
+
+                elif config_cambio:
+                    # ── IP existente pero su config cambió: reiniciar reader ──
+                    logger.info(f"🔄 Config cambió para {ip} — reiniciando PLC reader con nueva config")
+
+                    # Cancelar el reader actual y esperar que termine limpio
+                    tasks[ip].cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(tasks[ip]), timeout=2.0)
+                    except Exception:
+                        pass
+
+                    # Arrancar reader con config actualizada
+                    reader_task = asyncio.create_task(plc_reader(ip, port, config_nueva))
+                    tasks[ip] = reader_task
+                    logger.info(f"✅ PLC reader reiniciado para {ip} con config actualizada")
 
             # Detener tareas para IPs que ya no existen
             for ip in list(tasks.keys()):
