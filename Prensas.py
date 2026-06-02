@@ -997,8 +997,10 @@ def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> list:
         #  LOGGING: Mostrar números que se van a buscar
         log.info(f"🔍 Buscando en SQL Server los siguientes números (sin espacios): {numeros_sin_espacios}")
 
+        # FIX: incluir is_obsolete para filtrar en este mismo paso y no depender
+        # de crear_nuevo_registro para rechazar obsoletos uno a uno.
         sql_check = f"""
-            SELECT REPLACE(pn.number, ' ', '') FROM part_numbers pn
+            SELECT REPLACE(pn.number, ' ', ''), pn.is_obsolete FROM part_numbers pn
             JOIN work_centers wc ON pn.work_center_id = wc.id
             WHERE wc.name = ? AND REPLACE(pn.number, ' ', '') IN ({placeholders})
         """
@@ -1008,27 +1010,41 @@ def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> list:
         cursor_sql.execute(sql_check, params)
 
         rows = cursor_sql.fetchall()
-        numeros_parte_validados = [row[0] for row in rows if row[0]]
 
-        log.info(f"✅ SQL Server validó {len(numeros_parte_validados)} números de parte para estación {estacion}")
+        # Separar todos los encontrados de los activos (no obsoletos)
+        todos_encontrados       = [row[0] for row in rows if row[0]]
+        obsoletos               = [row[0] for row in rows if row[0] and row[1] == 1]
+        numeros_parte_validados = [row[0] for row in rows if row[0] and row[1] != 1]
 
-        #  LOGGING: Mostrar qué números se encontraron
+        log.info(f"✅ SQL Server validó {len(todos_encontrados)} números de parte para estación {estacion}")
+        log.info(f"   Números encontrados (total): {todos_encontrados}")
+
+        if obsoletos:
+            log.warning(
+                f"⚠️ Filtrados {len(obsoletos)} número(s) OBSOLETO(S) en validación de MDI={mdi} "                f"estacion={estacion}: {obsoletos}. Solo se usarán los activos: {numeros_parte_validados}"
+            )
+
         if numeros_parte_validados:
-            log.info(f"   Números encontrados: {numeros_parte_validados}")
+            log.info(f"   Números activos (no obsoletos): {numeros_parte_validados}")
         else:
             log.warning(f"   Números buscados: {numeros_sin_espacios}")
-            log.warning(f"   Números encontrados: NINGUNO")
+            log.warning(f"   Números encontrados: NINGUNO activo")
 
-        #  NUEVO: Si AS400 tenía números pero SQL Server no encontró ninguno válido para esta estación
+        # Si todos eran obsoletos o no existían en SQL, retornar vacío con motivo detallado
         if not numeros_parte_validados:
-            log.warning(f"⚠️ AS400 retornó {len(numeros_parte_posibles)} números pero ninguno válido para estación {estacion}")
-            # Registrar todos los números que AS400 retornó pero que no están en SQL Server
-            numeros_str = ", ".join(numeros_parte_posibles[:5])  # Primeros 5
-            if len(numeros_parte_posibles) > 5:
-                numeros_str += f" (y {len(numeros_parte_posibles)-5} más)"
-
-            log.warning(f"⚠️ Ningún número válido para estacion: MDI={mdi}, números={numeros_str}")
-            res = ([], "NUMEROS_NO_VALIDOS_ESTACION_SQL")
+            if obsoletos and not (set(todos_encontrados) - set(obsoletos)):
+                log.warning(
+                    f"⚠️ Todos los números para MDI={mdi} en {estacion} son OBSOLETOS: {obsoletos}"
+                )
+                res = ([], "TODOS_OBSOLETOS")
+            else:
+                numeros_str = ", ".join(numeros_parte_posibles[:5])
+                if len(numeros_parte_posibles) > 5:
+                    numeros_str += f" (y {len(numeros_parte_posibles)-5} más)"
+                log.warning(
+                    f"⚠️ AS400 retornó {len(numeros_parte_posibles)} números pero ninguno válido "                    f"para estación {estacion}. MDI={mdi}, números={numeros_str}"
+                )
+                res = ([], "NUMEROS_NO_VALIDOS_ESTACION_SQL")
             validacion_estampado_cache[cache_key] = res
             return res
 
@@ -1404,10 +1420,11 @@ class IPDataCollector:
                     logger.warning(f"Cola llena para {self.ip}, descartando batch")
             if self.ip in system_monitor['ips']:
                 system_monitor['ips'][self.ip].update({'conectado': True, 'ultima_lectura': now})
+        except OSError:
+            raise  # Ya fue logueado en el bloque interno, evitar log duplicado
         except Exception as e:
             logger.error(f"Error en collect_and_enqueue para {self.ip}: {str(e)[:100]}")
             raise
-
 # ═══════════════════════════ PROCESADOR (CONSUMIDOR) ═══════════════════════════
 
 class IPDataProcessor:
@@ -1727,7 +1744,7 @@ class IPDataProcessor:
                     troquel_id = d.get('troquel_id')
                     
                     lado_actual = d.get('lado', '--')
-                    cache_key = f"{estacion}_{lado_actual}"
+                    cache_key = f"{estacion}_{num_orig}_{num}_{lado_actual}"
                     current_state = {"parte_original": num_orig, "contador": cnt}
                     previous_state = self.last_scanned_parts.get(cache_key)
 
@@ -1771,7 +1788,32 @@ class IPDataProcessor:
                         
                         if not new_record or new_record.get('id_registro') is None:
                              continue
-                        
+
+                        # FIX histories: el primer tramo (desde el offset hasta cnt actual)
+                        # nunca llega al bloque if cnt != prev porque contador_registro se
+                        # inicializa igual a cnt. Lo escribimos aquí directamente.
+                        _offset_nuevo  = new_record.get('offset_variable', 0)
+                        _mult_nuevo    = new_record.get('multiplicador', 1)
+                        # _corrida_nueva siempre es 0 en registro nuevo (condición redundante eliminada)
+                        _delta_inicial = cnt - _offset_nuevo
+
+                        if _delta_inicial > 0:
+                            # Solo registramos si hay piezas reales en este primer tramo
+                            pid_nuevo = obtener_part_number_id(cursor, num, estacion)
+                            if pid_nuevo:
+                                _qty_hist_ini = _delta_inicial  # estampado guarda golpes sin multiplicar
+                                extras_ini = {'troquel_id': troquel_id}
+                                try:
+                                    db_strategy.insertar_history(
+                                        cursor, pid_nuevo, _qty_hist_ini, fecha_fmt,
+                                        d.get('tiempo', 0.0), extras_ini
+                                    )
+                                    log.info(
+                                        f"📝 History inicial registrado al crear nuevo registro {num}: "                                        f"delta={_delta_inicial}, offset={_offset_nuevo}, turno={turno}"
+                                    )
+                                except Exception as _e_h:
+                                    log.error(f"❌ Error insertando history inicial para {num}: {_e_h}")
+
                         # Si llegamos aquí, el registro se creó bien, la parte SÍ es válida en DB
                         lado_actual = d.get('lado', 'GLOBAL')
                         if estacion in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][estacion]:
@@ -1840,6 +1882,26 @@ class IPDataProcessor:
                                 f"contador_registro={reg.get('contador_registro')}, corrida_previa={reg.get('corrida_previa', 0)}"
                             )
                             
+                            # FIX 2a: El delta inicial del nuevo turno nunca llega al bloque
+                            # "if cnt != prev" porque contador_registro ya se inicializó en cnt.
+                            # Se registra aquí directamente para no perder ese primer incremento.
+                            _offset_ct = reg.get('offset_variable', 0)
+                            _delta_ct  = cnt - _offset_ct
+                            if _delta_ct > 0:
+                                _pid_ct = obtener_part_number_id(cursor, num, estacion)
+                                if _pid_ct:
+                                    _extras_ct = {'troquel_id': troquel_id}
+                                    try:
+                                        db_strategy.insertar_history(
+                                            cursor, _pid_ct, _delta_ct, fecha_fmt,
+                                            d.get('tiempo', 0.0), _extras_ct
+                                        )
+                                        log.info(
+                                            f"📝 History cambio de turno: {num} "
+                                            f"delta={_delta_ct}, offset={_offset_ct}, turno={turno}"
+                                        )
+                                    except Exception as _eh_ct:
+                                        log.error(f"❌ Error history cambio turno {num}: {_eh_ct}")
                         state_changed = True
 
                     prev = reg.get("contador_registro", cnt)
@@ -2048,22 +2110,41 @@ async def plc_reader(ip, port, group_info):
                     last_read_time = current_time
 
                 except OSError as read_error:
-                    # FIX WinError 10054 / 10061 durante lectura activa
                     winerr = getattr(read_error, 'winerror', None) or read_error.errno
-                    if winerr == 10054:
+                    err_str = str(read_error)
+
+                    # Timeout reconectar pero con delay corto
+                    if "timed out" in err_str and winerr is None:
+                        logger.warning(f"⏱️ Timeout leyendo PLC {ip} — cerrando socket y reconectando (delay corto)...")
+                        try: plc.close()
+                        except Exception: pass
+                        connected = False
+                        plc = create_plc_instance()
+                        await asyncio.sleep(2)
+                        
+
+                    # WinError reales: requieren cierre de socket y reconexión completa
+                    elif winerr == 10054:
                         logger.warning(f"🔌 WinError 10054 – PLC {ip} cerró la conexión durante lectura (Connection Reset by Peer). Reconectando...")
+                        try: plc.close()
+                        except Exception: pass
+                        connected = False
+                        plc = create_plc_instance()
+                        await asyncio.sleep(RECONNECT_DELAY)
                     elif winerr == 10061:
                         logger.warning(f"🔌 WinError 10061 – PLC {ip} rechazó la lectura (Connection Refused). Reconectando...")
+                        try: plc.close()
+                        except Exception: pass
+                        connected = False
+                        plc = create_plc_instance()
+                        await asyncio.sleep(RECONNECT_DELAY)
                     else:
-                        logger.error(f"⚠️ OSError [{winerr}] en lectura PLC {ip}: {str(read_error)[:120]}")
-                    # Cerrar socket ANTES de recrear la instancia (evita 10061 en el siguiente intento)
-                    try:
-                        plc.close()
-                    except Exception:
-                        pass
-                    connected = False
-                    plc = create_plc_instance()
-                    await asyncio.sleep(RECONNECT_DELAY)
+                        logger.error(f"⚠️ OSError [{winerr}] en lectura PLC {ip}: {err_str[:120]}")
+                        try: plc.close()
+                        except Exception: pass
+                        connected = False
+                        plc = create_plc_instance()
+                        await asyncio.sleep(RECONNECT_DELAY)
                 except Exception as read_error:
                     logger.error(f"❌ Error en lectura PLC {ip}: {str(read_error)[:100]}")
                     try:

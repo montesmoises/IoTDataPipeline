@@ -1,13 +1,26 @@
 {
-    "2500T  TR_DGH954271_LH": {
-        "id_registro": 80699,
+    "2500T  TR_BDTS53611_LH": {
+        "id_registro": 80747,
         "quantity_planeada": 0,
-        "corrida_previa": 689,
+        "corrida_previa": 0,
         "multiplicador": 1,
-        "contador_registro": 0,
+        "contador_registro": 581,
         "offset_variable": 0,
-        "hora_cambio": "08:46:22",
-        "numero_original": "DGH953/54271/273",
+        "hora_cambio": "09:58:37",
+        "numero_original": "BDTS53/54611",
+        "lado": "LH",
+        "necesita_production_start": false,
+        "error_bd": null
+    },
+    "2500T  TR_BDTS54611_LH": {
+        "id_registro": 80748,
+        "quantity_planeada": 0,
+        "corrida_previa": 0,
+        "multiplicador": 1,
+        "contador_registro": 581,
+        "offset_variable": 0,
+        "hora_cambio": "09:58:37",
+        "numero_original": "BDTS53/54611",
         "lado": "LH",
         "necesita_production_start": false,
         "error_bd": null
