@@ -752,12 +752,15 @@ def load_config():
         return {}
     # NOTA: No cerramos la conexión aquí, el pool la maneja
 
-def actualizar_registro(cursor, contador, fecha_fmt, record_id, status, log, start_fmt=None, necesita_start=False):
+def actualizar_registro(cursor, delta_produccion, fecha_fmt, record_id, status, log, start_fmt=None, necesita_start=False):
     """
-    Actualiza el registro de producción.
+    Suma el delta de producción al registro (modelo incremental).
+    La BD es la dueña del acumulado: produced_quantity = produced_quantity + delta.
+    Así, un reset de contador o una pérdida del state_cache nunca destruyen
+    lo ya registrado, y dos lados produciendo la misma parte suman sin pisarse.
     """
-    sql_parts = ["produced_quantity=?", "production_end=?", "status_id=?"]
-    params = [contador, fecha_fmt, status]
+    sql_parts = ["produced_quantity = produced_quantity + ?", "production_end=?", "status_id=?"]
+    params = [delta_produccion, fecha_fmt, status]
 
     if start_fmt:
         sql_parts.insert(0, "production_start=?")
@@ -906,6 +909,48 @@ def decodificar_bloque(bloque):
         return original, [], {}
 
     return original, [limpia], {}
+
+def procesar_numero_parte(numero_plc):
+    """
+    Expande el número de parte del PLC en todas sus combinaciones.
+
+    El PLC puede condensar varios números en una sola cadena usando '/' como
+    separador de alternativas dentro de un segmento:
+
+        'DGH9 53 83 XB/ZB'  ->  ['DGH95383XB', 'DGH95383ZB']
+        'ABC 12/34 99'      ->  ['ABC1299', 'ABC3499']
+
+    Se divide primero por espacios (segmentos) y luego cada segmento por '/'
+    (alternativas); el producto cartesiano de los segmentos da las combinaciones.
+    Los espacios se eliminan del resultado para empatar con la comparación
+    REPLACE(pn.number, ' ', '') que usan las consultas contra part_numbers.
+
+    NO aplica a Estampado: esa área resuelve el MDI contra AS400 mediante
+    validar_numeros_parte_estampado().
+    """
+    if not numero_plc:
+        return []
+
+    segmentos = []
+    for seg in numero_plc.split(' '):
+        if not seg:
+            continue
+        # Alternativas del segmento, descartando vacías (p.ej. 'XB/' -> ['XB'])
+        alternativas = [alt for alt in seg.split('/') if alt]
+        if alternativas:
+            segmentos.append(alternativas)
+
+    if not segmentos:
+        return []
+
+    combinaciones = []
+    for combo in product(*segmentos):
+        nombre = ''.join(combo).replace(' ', '').strip()
+        # Dedup: 'AB/AB' no debe generar dos registros para el mismo número
+        if nombre and nombre not in combinaciones:
+            combinaciones.append(nombre)
+
+    return combinaciones
 
 # ═══════════════════════════ 🆕 NUEVA FUNCIÓN: VALIDACIÓN ESTAMPADO ═══════════════════════════
 
@@ -1227,6 +1272,18 @@ class IPDataCollector:
 
         return merged_requests
 
+    def _lectura_degradada(self, cfg, block_data):
+        """
+        True si algún bloque que usa la estación falló en la lectura (quedó en None).
+        Permite distinguir "la estación dejó de producir" de "no pude leer la estación":
+        en el segundo caso el estado en caché debe conservarse intacto.
+        """
+        for info in cfg.values():
+            key = (info.get('address'), info.get('long'))
+            if key in block_data and block_data[key] is None:
+                return True
+        return False
+
     def _process_station_data(self, estacion, cfg, block_data, timestamp):
         """Procesa datos de una estación específica obtenida de los bloques"""
         from collections import defaultdict
@@ -1316,11 +1373,20 @@ class IPDataCollector:
                         'lado': grp  # 🆕 Identificar el lado/grupo
                     })
             else:
-                # Para otras áreas, mantener el comportamiento original
-                if partes['list']:
-                    for p_nombre in partes['list']:
-                        if not p_nombre:
-                            continue
+                # Otras áreas: expandir el número del PLC en sus combinaciones.
+                # Un solo contador puede corresponder a varios números de parte
+                # (p.ej. 'DGH9 53 83 XB/ZB' -> DGH95383XB y DGH95383ZB); cada uno
+                # lleva el MISMO contador y sigue su propio proceso/registro.
+                nombres_parte = procesar_numero_parte(partes['orig'])
+
+                if len(nombres_parte) > 1:
+                    log.info(
+                        f"🔀 Número de parte expandido en {estacion}/{grp}: "
+                        f"'{partes['orig']}' -> {nombres_parte} (contador={data['contador']})"
+                    )
+
+                if nombres_parte:
+                    for p_nombre in nombres_parte:
                         datos_estacion.append({
                         'parte': p_nombre,
                         'original': partes['orig'],
@@ -1385,9 +1451,12 @@ class IPDataCollector:
             now = datetime.now()
             for est in self.estaciones:
                 cfg = group_info['station_configs'].get(est, {})
+                # plc_ok=False marca lectura incompleta: el consumidor conserva el
+                # caché en vez de cerrar registros por ausencia de datos.
+                lectura_ok = not self._lectura_degradada(cfg, block_data)
                 datos_estacion = self._process_station_data(est, cfg, block_data, now)
                 if datos_estacion:
-                    batch.append({'estacion': est, 'datos': datos_estacion, 'ts': now, 'area': self.area, 'plc_ok': True})
+                    batch.append({'estacion': est, 'datos': datos_estacion, 'ts': now, 'area': self.area, 'plc_ok': lectura_ok})
                     if est in system_monitor['estaciones']:
                         if 'lados' not in system_monitor['estaciones'][est]:
                             system_monitor['estaciones'][est]['lados'] = {}
@@ -1412,7 +1481,12 @@ class IPDataCollector:
                             system_monitor['estaciones'][est]['lados'][lado] = {'parte_actual': dato['original'] + status_validacion, 'contador': dato['contador'], 'tiempo_ciclo': dato['tiempo'], 'validado': validado_flag, 'error_validacion': error_val}
                         system_monitor['estaciones'][est].update({'ultima_actualizacion': now, 'ip': self.ip})
                 else:
-                    batch.append({'estacion': est, 'datos': [], 'ts': now, 'area': self.area, 'plc_ok': True})
+                    if not lectura_ok:
+                        logger.warning(
+                            f"⚠️ Lectura incompleta de {est} en PLC {self.ip}: "
+                            f"se preserva el estado en caché (no se cierran registros)."
+                        )
+                    batch.append({'estacion': est, 'datos': [], 'ts': now, 'area': self.area, 'plc_ok': lectura_ok})
             if batch and self.ip in ip_data_queues:
                 try:
                     ip_data_queues[self.ip].put_nowait(batch)
@@ -1486,135 +1560,100 @@ class IPDataProcessor:
         except Exception as e:
             logger.error(f"Error guardando estado para {self.ip}: {e}")
 
-    def _ensure_active_record(self, cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, force_offset=None, lado='--'):
+    def _ensure_active_record(self, cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, contador_previo=None, lado='--'):
         """
         Garantiza que exista un registro activo (Status 7) para la estación y parte.
-        Hybrid Logic:
-        - Normal (force_offset=None): Offset=0 (Absolute).
-        - Shift Change (force_offset=X): Offset=X (Relative).
+        Modelo incremental: la BD es la dueña del acumulado (produced_quantity);
+        aquí solo se fija la línea base del contador (contador_registro = cnt)
+        desde donde se calcularán los deltas. No se reconstruyen offsets ni
+        corridas: lo ya producido permanece intacto en BD.
+        - contador_previo: en cambio de turno, valor del contador al cierre del
+          turno anterior; el avance (cnt - contador_previo) es la producción
+          inicial del nuevo registro.
         """
         id_reg, q_plan, q_prod, status, prod_start_db, mult = obtener_id_registro_activo(
             cursor, estacion, fecha_plan, turno, num, log
         )
-        
-        mult = mult or 1
-        
-        # Lógica de Offset y Recuperación
-        # Si ya existe registro con producción, el offset original debió ser (cnt_actual - produccion / mult)
-        # Esto asume que NO hubo resets intermedios. Si hubo, el offset recuperado será aproximado al último reset.
-        # Para mayor precisión en reinicios, idealmente el JSON persiste. Esto es el fallback.
-        offset_calculado = 0
-        corrida_previa_recuperada = 0
 
-        #  NUEVO: Lógica de recuperación ajustada para Lados Compartidos
-        # Si compartimos ID con otro lado, la producción DB será la SUMA total.
-        # No podemos usar production_actual_db para calcular MI offset individual confiablemente.
-        # SOLUCIÓN: Si es una recuperación desde cero (sin JSON), asumimos Offset=0 (Absoluto) o Offset=Cnt (Relativo)
-        # dependiendo de la política. Por seguridad en fallo eléctrico, intentamos recuperar lo que podemos.
-        
-        if id_reg and (q_prod or 0) > 0:
-            # Recuperación Inversa: Offset = PLC_Actual - Producción_DB
-            # Nota: Si hubo resets, esto nos da el "Offset Efectivo" actual.
-            produccion_actual_db = q_prod or 0
-            
-            #  ADVERTENCIA: Si hay otro lado sumando, produccion_actual_db > mi_produccion.
-            # Esto haría que (prod_db / mult) sea grande y el offset calculado sea muy pequeño o negativo.
-            # Si el offset calculado es negativo, es señal clara de que hay otro lado aportando.
-            # En ese caso, la recuperación inversa NO ES FIABLE para separar lados.
-            # FALLBACK: Si no hay JSON, asumir Offset=0 (conteo absoluto del PLC actual)
-            # Esto puede duplicar pocas piezas si el PLC no se reseteó, pero es más seguro que corromper el offset.
-            
-            offset_calculado = 0 # Default seguro
-            
-            # Intento de recuperación inteligente solo si parece razonable (PLC > DB)
-            if cnt * mult >= produccion_actual_db:
-                 offset_calculado = cnt - (produccion_actual_db / mult)
-            else:
-                 # PLC < DB (Reseteo o Múltiples Lados sumando)
-                 log.warning(f"⚠️ Inconsistencia/Lados Múltiples al recuperar {lado}: PLC ({cnt}) < BD ({produccion_actual_db}). Asumiendo Offset=0.")
-                 offset_calculado = 0
-        
-        elif id_reg:
-            # Registro existe pero en 0.
-            offset_calculado = force_offset if force_offset is not None else 0
+        mult = mult or 1
 
         # Casos de Retorno (Diccionario de estado)
         reg_state = {
             'id_registro': None,
             'quantity_planeada': 0,
-            'corrida_previa': corrida_previa_recuperada, 
             'multiplicador': mult,
-            'contador_registro': cnt,
-            'offset_variable': offset_calculado,
+            'contador_registro': cnt,  # Línea base: los deltas se cuentan desde aquí
             'hora_cambio': datetime.now().time().replace(microsecond=0),
             'numero_original': num_orig,
             'lado': lado,  # 🆕 Persistir el lado
             'necesita_production_start': False,
-            'error_bd': None # 🆕 Para propagar el error de BD
+            'error_bd': None,  # 🆕 Para propagar el error de BD
+            'registro_creado': False,  # True solo si el registro se insertó en esta llamada
+            'delta_inicial': 0  # Golpes del primer tramo (solo aplica a registros creados)
         }
 
         # CASO 1: CREAR NUEVO
         if id_reg is None:
-            # Hybrid Logic Decision:
-            if force_offset is not None:
-                # Caso Cambio de Turno: Relativo al contador previo del turno anterior.
-                # Protección: si el PLC ya reinició o bajó su contador, jamás crear un registro negativo.
-                offset_calculado = force_offset
-                delta_inicial = cnt - offset_calculado
-
+            if contador_previo is not None:
+                # Cambio de turno: la producción inicial es el avance desde el
+                # contador con que cerró el turno anterior.
+                delta_inicial = cnt - contador_previo
                 if delta_inicial < 0:
                     log.warning(
                         f"⚠️ Cambio de turno con delta negativo detectado en {estacion}/{num}/{lado}: "
-                        f"cnt_actual={cnt}, contador_previo_turno={offset_calculado}, mult={mult}. "
+                        f"cnt_actual={cnt}, contador_previo_turno={contador_previo}, mult={mult}. "
                         f"Se fuerza qty_inicial=0 para evitar negativos en production_records."
                     )
-                    qty_inicial = 0
-                else:
-                    qty_inicial = delta_inicial * mult
+                    delta_inicial = 0
+                qty_inicial = delta_inicial * mult
 
                 log.info(
                     f"🕒 Nuevo registro por cambio de turno en {estacion}/{num}/{lado}: "
-                    f"cnt_actual={cnt}, offset_turno={offset_calculado}, delta_inicial={max(delta_inicial, 0)}, "
+                    f"cnt_actual={cnt}, contador_previo={contador_previo}, delta_inicial={delta_inicial}, "
                     f"qty_inicial={qty_inicial}, turno={turno}"
                 )
             else:
-                # Caso Normal (Parte Nueva): Absoluto
-                offset_calculado = 0
-                if mult == 1: 
+                # Parte nueva: el contador actual del PLC pertenece a esta corrida.
+                if mult == 1:
                     mult = obtener_multiplicador_as400(num, estacion, log) or 1
+                delta_inicial = cnt
                 qty_inicial = cnt * mult
 
             id_reg, q_plan, q_prod, mult_new, error_bd = crear_nuevo_registro(
                 cursor, num, estacion, qty_inicial, turno, fecha_fmt, fecha_plan, num_orig, log
             )
-            
-            if id_reg is None: 
+
+            if id_reg is None:
                 reg_state['error_bd'] = error_bd
                 return reg_state
-            
+
             reg_state.update({
-                'id_registro': id_reg, 
+                'id_registro': id_reg,
                 'quantity_planeada': q_plan,
-                'corrida_previa': 0, 
                 'multiplicador': mult_new or mult,
-                'offset_variable': offset_calculado,
-                'necesita_production_start': False  # ✅ Corregido: Ya tiene start del INSERT
+                'necesita_production_start': False,  # ✅ Ya tiene start del INSERT
+                'registro_creado': True,
+                'delta_inicial': delta_inicial
             })
             return reg_state
 
-        # CASO 2: REACTIVAR (Status 8)
+        # CASO 2: REACTIVAR (Status 8) — mismo registro, mismo acumulado.
+        # Lo producido antes sigue en BD; lo nuevo se sumará como delta a partir
+        # del contador actual del PLC (haya reset o no).
         if status == 8:
             try:
                 cursor.execute("UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8", (id_reg,))
-                log.info(f"✅ Registro {id_reg} reactivado (status 8 → 7)")
+                log.info(
+                    f"✅ Registro {id_reg} reactivado (status 8 → 7). "
+                    f"Acumulado BD preservado: {q_prod or 0}. Conteo continúa desde cnt={cnt}."
+                )
             except Exception as e:
                 log.error(f"❌ Error reactivando registro {id_reg}: {e}")
-            
+
             reg_state.update({
                 'id_registro': id_reg,
                 'quantity_planeada': q_plan,
                 'multiplicador': mult,
-                'offset_variable': offset_calculado, # Asegurar que el offset se propague
                 'necesita_production_start': False
             })
             return reg_state
@@ -1622,12 +1661,11 @@ class IPDataProcessor:
         # CASO 3: ACTIVO
         if prod_start_db is None and status == 3:
             reg_state['necesita_production_start'] = True
-            
+
         reg_state.update({
             'id_registro': id_reg,
             'quantity_planeada': q_plan,
             'multiplicador': mult,
-            'offset_variable': offset_calculado, # Asegurar que el offset se propague
         })
         return reg_state
 
@@ -1687,7 +1725,18 @@ class IPDataProcessor:
 
                 fecha_fmt = now.strftime('%Y-%m-%d %H:%M:%S')
 
-                if plc_ok and not datos:
+                if not datos:
+                    if not plc_ok:
+                        # Lectura incompleta/fallida: NO se puede concluir que la estación
+                        # dejó de producir. Se conserva el caché (línea base de contadores)
+                        # para que al reconectar el delta recupere lo producido en el hueco.
+                        log.warning(
+                            f"⚠️ Lectura incompleta del PLC para {estacion}. "
+                            f"Manteniendo estado en caché sin cambios."
+                        )
+                        return
+
+                    # Lectura buena y sin partes: la estación sí dejó de producir.
                     cursor.execute("""
                         UPDATE pr SET pr.status_id = 8, pr.production_end=?
                         FROM production_records pr
@@ -1705,10 +1754,6 @@ class IPDataProcessor:
                     if state_changed: self.save_state()
                     return
 
-                if not plc_ok:
-                    log.warning(f"⚠️ PLC desconectado para {estacion}. Manteniendo estado en caché sin cambios.")
-                    return
-
                 claves_actuales_en_plc = set()
                 for d in datos:
                     if d['parte']:  # Solo agregar si tiene parte válida
@@ -1716,25 +1761,34 @@ class IPDataProcessor:
                         lado = d.get('lado', '--')
                         claves_actuales_en_plc.add(f"{estacion}_{d['parte']}_{lado}")
 
-                claves_obsoletas = []
-                for k in self.active_records:
-                    # 🆕 Verificar prefijo y ausencia en claves actuales
-                    if k.startswith(f"{estacion}_") and k not in claves_actuales_en_plc:
-                        claves_obsoletas.append(k)
+                # Cierre por ausencia SOLO con lectura completa: en una lectura parcial
+                # (p.ej. falló el bloque de un lado) la ausencia de una parte no significa
+                # que dejó de producirse, y cerrarla borraría su línea base de contador.
+                if plc_ok:
+                    claves_obsoletas = []
+                    for k in self.active_records:
+                        # 🆕 Verificar prefijo y ausencia en claves actuales
+                        if k.startswith(f"{estacion}_") and k not in claves_actuales_en_plc:
+                            claves_obsoletas.append(k)
 
-                for k in claves_obsoletas:
-                    record_id = self.active_records[k].get('id_registro')
-                    if record_id:
-                         try:
-                            cursor.execute(
-                                "UPDATE production_records SET status_id = 8, production_end=? WHERE id=? AND status_id=7",
-                                (fecha_fmt, record_id)
-                            )
-                         except Exception as e:
-                            log.error(f"Error cerrando registro obsoleto {record_id}: {e}")
+                    for k in claves_obsoletas:
+                        record_id = self.active_records[k].get('id_registro')
+                        if record_id:
+                             try:
+                                cursor.execute(
+                                    "UPDATE production_records SET status_id = 8, production_end=? WHERE id=? AND status_id=7",
+                                    (fecha_fmt, record_id)
+                                )
+                             except Exception as e:
+                                log.error(f"Error cerrando registro obsoleto {record_id}: {e}")
 
-                    del self.active_records[k]
-                    state_changed = True
+                        del self.active_records[k]
+                        state_changed = True
+                else:
+                    log.warning(
+                        f"⚠️ Lectura parcial del PLC en {estacion}: se omite el cierre de "
+                        f"registros ausentes para no perder su contador base."
+                    )
 
                 for d in datos:
                     num = d['parte']
@@ -1789,30 +1843,28 @@ class IPDataProcessor:
                         if not new_record or new_record.get('id_registro') is None:
                              continue
 
-                        # FIX histories: el primer tramo (desde el offset hasta cnt actual)
-                        # nunca llega al bloque if cnt != prev porque contador_registro se
-                        # inicializa igual a cnt. Lo escribimos aquí directamente.
-                        _offset_nuevo  = new_record.get('offset_variable', 0)
-                        _mult_nuevo    = new_record.get('multiplicador', 1)
-                        # _corrida_nueva siempre es 0 en registro nuevo (condición redundante eliminada)
-                        _delta_inicial = cnt - _offset_nuevo
-
-                        if _delta_inicial > 0:
-                            # Solo registramos si hay piezas reales en este primer tramo
-                            pid_nuevo = obtener_part_number_id(cursor, num, estacion)
-                            if pid_nuevo:
-                                _qty_hist_ini = _delta_inicial  # estampado guarda golpes sin multiplicar
-                                extras_ini = {'troquel_id': troquel_id}
-                                try:
-                                    db_strategy.insertar_history(
-                                        cursor, pid_nuevo, _qty_hist_ini, fecha_fmt,
-                                        d.get('tiempo', 0.0), extras_ini
-                                    )
-                                    log.info(
-                                        f"📝 History inicial registrado al crear nuevo registro {num}: "                                        f"delta={_delta_inicial}, offset={_offset_nuevo}, turno={turno}"
-                                    )
-                                except Exception as _e_h:
-                                    log.error(f"❌ Error insertando history inicial para {num}: {_e_h}")
+                        # History inicial: SOLO cuando el registro se CREÓ en esta pasada.
+                        # El primer tramo (0 → cnt) nunca llega al bloque "if cnt != prev"
+                        # porque contador_registro se inicializa igual a cnt.
+                        # En recuperaciones/reactivaciones NO se inserta nada: esos golpes
+                        # ya están en histories y volver a insertarlos los duplicaría.
+                        if new_record.get('registro_creado'):
+                            _delta_inicial = new_record.get('delta_inicial', 0)
+                            if _delta_inicial > 0:
+                                pid_nuevo = obtener_part_number_id(cursor, num, estacion)
+                                if pid_nuevo:
+                                    extras_ini = {'troquel_id': troquel_id}
+                                    try:
+                                        db_strategy.insertar_history(
+                                            cursor, pid_nuevo, _delta_inicial, fecha_fmt,
+                                            d.get('tiempo', 0.0), extras_ini
+                                        )
+                                        log.info(
+                                            f"📝 History inicial registrado al crear nuevo registro {num}: "
+                                            f"delta={_delta_inicial}, turno={turno}"
+                                        )
+                                    except Exception as _e_h:
+                                        log.error(f"❌ Error insertando history inicial para {num}: {_e_h}")
 
                         # Si llegamos aquí, el registro se creó bien, la parte SÍ es válida en DB
                         lado_actual = d.get('lado', 'GLOBAL')
@@ -1834,14 +1886,11 @@ class IPDataProcessor:
                     if cambio_turno:
                         old_id = reg['id_registro']
                         prev_counter = reg.get('contador_registro', cnt)
-                        prev_offset = reg.get('offset_variable', 0)
-                        prev_corrida = reg.get('corrida_previa', 0)
 
                         log.warning(
                             f"🕒 Cambio de turno detectado en {estacion}/{num}/{d.get('lado', '--')}: "
                             f"hora_anterior={reg.get('hora_cambio')}, hora_actual={hora}, "
-                            f"contador_previo={prev_counter}, contador_actual={cnt}, "
-                            f"offset_actual={prev_offset}, corrida_previa={prev_corrida}, old_id={old_id}"
+                            f"contador_previo={prev_counter}, contador_actual={cnt}, old_id={old_id}"
                         )
 
                         try:
@@ -1863,93 +1912,102 @@ class IPDataProcessor:
 
                         log.info(
                             f"🔄 Preparando nuevo registro por turno para {estacion}/{num}/{d.get('lado', '--')}: "
-                            f"turno_nuevo={turno}, fecha_plan={fecha_plan}, force_offset={prev_counter}, cnt_actual={cnt}"
+                            f"turno_nuevo={turno}, fecha_plan={fecha_plan}, contador_previo={prev_counter}, cnt_actual={cnt}"
                         )
 
-                        # Crear NUEVO registro de TURNO
-                        # HYBRID LOGIC: Cambio de turno -> Relativo al contador PREVIO
+                        # Crear/obtener el registro del NUEVO turno.
                         new_reg_data = self._ensure_active_record(
-                            cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, 
-                            force_offset=prev_counter,
+                            cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt,
+                            contador_previo=prev_counter,
                             lado=d.get('lado', '--')
                         )
-                        
-                        if new_reg_data:
+
+                        if new_reg_data and new_reg_data.get('id_registro'):
                             reg.update(new_reg_data)
                             log.info(
                                 f"✅ Nuevo estado tras cambio de turno en {estacion}/{num}/{d.get('lado', '--')}: "
-                                f"nuevo_id={reg.get('id_registro')}, offset={reg.get('offset_variable')}, "
-                                f"contador_registro={reg.get('contador_registro')}, corrida_previa={reg.get('corrida_previa', 0)}"
+                                f"nuevo_id={reg.get('id_registro')}, "
+                                f"contador_registro={reg.get('contador_registro')}"
                             )
-                            
-                            # FIX 2a: El delta inicial del nuevo turno nunca llega al bloque
-                            # "if cnt != prev" porque contador_registro ya se inicializó en cnt.
-                            # Se registra aquí directamente para no perder ese primer incremento.
-                            _offset_ct = reg.get('offset_variable', 0)
-                            _delta_ct  = cnt - _offset_ct
-                            if _delta_ct > 0:
+
+                            # Avance de este lado desde el cierre del turno anterior.
+                            # Si el registro se creó en esta llamada, qty_inicial ya lo
+                            # incluye; si ya existía (p.ej. lo creó el otro lado o se
+                            # reactivó), se suma como delta para no perderlo ni duplicar.
+                            delta_turno = max(cnt - prev_counter, 0)
+                            if delta_turno > 0:
+                                if not new_reg_data.get('registro_creado'):
+                                    _necesita_start_ct = reg.get('necesita_production_start', False)
+                                    actualizar_registro(
+                                        cursor,
+                                        delta_turno * reg.get('multiplicador', 1),
+                                        fecha_fmt,
+                                        reg['id_registro'],
+                                        7,
+                                        log,
+                                        necesita_start=_necesita_start_ct
+                                    )
+                                    if _necesita_start_ct:
+                                        reg['necesita_production_start'] = False
+
                                 _pid_ct = obtener_part_number_id(cursor, num, estacion)
                                 if _pid_ct:
                                     _extras_ct = {'troquel_id': troquel_id}
                                     try:
                                         db_strategy.insertar_history(
-                                            cursor, _pid_ct, _delta_ct, fecha_fmt,
+                                            cursor, _pid_ct, delta_turno, fecha_fmt,
                                             d.get('tiempo', 0.0), _extras_ct
                                         )
                                         log.info(
                                             f"📝 History cambio de turno: {num} "
-                                            f"delta={_delta_ct}, offset={_offset_ct}, turno={turno}"
+                                            f"delta={delta_turno}, turno={turno}"
                                         )
                                     except Exception as _eh_ct:
                                         log.error(f"❌ Error history cambio turno {num}: {_eh_ct}")
-                        state_changed = True
+                            state_changed = True
+                        else:
+                            # No se pudo crear/obtener el registro del turno nuevo.
+                            # NO se toca 'reg': conserva el id del turno anterior (ya
+                            # cerrado) y escribir ahí reabriría el turno equivocado.
+                            # Se omite esta parte en este ciclo; como hora_cambio no se
+                            # actualiza, el cambio de turno se reintenta en la siguiente
+                            # lectura sin perder el contador base.
+                            log.error(
+                                f"❌ No se pudo abrir registro del turno {turno} para "
+                                f"{estacion}/{num}/{d.get('lado', '--')}: se reintentará "
+                                f"en la siguiente lectura (contador base={prev_counter} preservado)."
+                            )
+                            continue
 
                     prev = reg.get("contador_registro", cnt)
 
                     if cnt != prev:
                         multiplicador = reg.get("multiplicador", 1)
-                        
+
                         # 🔍 DIAGNÓSTICO: Log de cambio de contador
                         log.debug(f"📊 Cambio contador en {num}: {prev} → {cnt}")
-                        
-                        # ⚠️ DETECCIÓN DE RESET (Bajada de contador con respecto al OFFSET o PREV?)
-                        # En modelo relativo, el offset es fijo. Solo si CNT baja a menor que Offset, o hubo un salto extraño.
-                        # Pero el reset clásico es que CNT se va a 0.
-                        offset = reg.get('offset_variable', 0)
-                        
-                        if cnt < prev: # Bajada detectada
-                            log.warning(f"⚠️ Reset detectado en {num}: {prev} -> {cnt}. Offset era {offset}")
-                            
-                            # Producción lograda hasta antes del reset con el offset viejo
-                            # Prod_Tramo = (Prev - Offset) * Mult
-                            # Esto se suma a corrida_previa
-                            if prev >= offset:
-                                lost_production_tramo = (prev - offset) * multiplicador
-                                reg['corrida_previa'] = reg.get('corrida_previa', 0) + lost_production_tramo
-                                log.info(f"   Acumulado {lost_production_tramo} a corrida_previa.")
-                            
-                            # Nuevo Offset: 0 (o el nuevo cnt si asumimos que reinició ahi)
-                            reg['offset_variable'] = 0
-                            offset = 0 # Actualizar localmente para el calculo abajo
-                        
-                        # MODELO RELATIVO ROBUSTO:
-                        # Producción = ((PLC - Offset) * Multi) + Corrida_Previa
-                        # Nota: Si PLC < Offset (ej. después de reset mal detectado), esto daría negativo.
-                        # Protección básica:
-                        if cnt >= offset:
-                            prod_tramo_actual = (cnt - offset) * multiplicador
+
+                        # MODELO INCREMENTAL: solo se calcula el delta de golpes desde
+                        # la última lectura; la BD acumula (produced_quantity += delta).
+                        if cnt >= prev:
+                            incremento_ciclo = cnt - prev
                         else:
-                            # Caso raro: CNT bajó pero no entró en el if detect de arriba (??) O offset quedó alto.
-                            # Si entramos aquí es que offset > cnt. Asumimos producción 0 del tramo y forzamos reset?
-                            prod_tramo_actual = 0
-                        
-                        prod_absoluta = prod_tramo_actual + reg.get('corrida_previa', 0)
-                        
+                            # Reset del contador (fin de corrida y reinicio con la misma
+                            # parte): lo producido antes del reset ya está acumulado en
+                            # BD; el contador nuevo son golpes de la corrida nueva.
+                            log.warning(
+                                f"⚠️ Reset detectado en {num}: {prev} -> {cnt}. "
+                                f"Acumulado en BD intacto; se suma el contador nuevo como delta."
+                            )
+                            incremento_ciclo = cnt
+
+                        delta_produccion = incremento_ciclo * multiplicador
+
                         necesita_start = reg.get('necesita_production_start', False)
 
                         actualizar_registro(
                             cursor,
-                            prod_absoluta,
+                            delta_produccion,
                             fecha_fmt,
                             reg['id_registro'],
                             7,
@@ -1959,20 +2017,11 @@ class IPDataProcessor:
 
                         pid = obtener_part_number_id(cursor, num, estacion)
                         if pid:
-                            if cnt >= prev:
-                                incremento_ciclo = cnt - prev
-                            else:
-                                incremento_ciclo = cnt # Asumiendo reset a 0
-
-                            cantidad_historial = incremento_ciclo * multiplicador
                             extras = {'troquel_id': troquel_id}
-                            # En area estampado se guarda el valor absoluto del contador en history, en otras el incremento
-                            # cantidad_history = cnt if "estampado" in str(area).lower() else cantidad_historial
-                            # En area estampado guardad el incremento sin multiplicar por el multiplicador
-                            cantidad_history = incremento_ciclo if "estampado" in str(area).lower() else incremento_ciclo
-
-                            if cantidad_history > 0:
-                                db_strategy.insertar_history(cursor, pid, cantidad_history, fecha_fmt, tiempo, extras)
+                            # En histories se guarda el incremento de golpes sin multiplicar
+                            # (mismo comportamiento para estampado y área general)
+                            if incremento_ciclo > 0:
+                                db_strategy.insertar_history(cursor, pid, incremento_ciclo, fecha_fmt, tiempo, extras)
 
                         if necesita_start:
                             reg['necesita_production_start'] = False
