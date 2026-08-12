@@ -3,16 +3,16 @@ import datetime
 import time as system_time
 from pymcprotocol import Type3E
 from datetime import datetime, time, timedelta, date
-from itertools import product, cycle, chain
-from collections import namedtuple, defaultdict
+from collections import defaultdict
 import asyncio, hashlib, pyodbc
+import functools
 import logging
 import os
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
-from abc import ABC, abstractmethod
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import re
 import json
 import traceback
@@ -22,6 +22,19 @@ from logging.handlers import RotatingFileHandler
 # CustomTkinter para la nueva UI
 import customtkinter as ctk
 from tkinter import ttk, StringVar
+
+# Lógica de negocio pura (sin PLC ni BD). Ver domain/__init__.py
+from domain.contadores import calcular_incremento, calcular_delta_turno, piezas_producidas
+from domain import turnos as _turnos
+
+# Comportamiento por área. Agregar un área = una clase + una línea. Ver areas/
+from areas import obtener_pipeline, ContextoArea
+
+# Acceso a datos. Todo el SQL vive en persistence/repositorio.py
+from persistence import repositorio as repo
+from persistence import estado as estado_store
+from persistence import catalogo
+from persistence.repositorio import actualizar_registro, obtener_part_number_id
 
 # ═══════════════════════════ CONFIGURACIÓN GLOBAL ═══════════════════════════
 
@@ -79,6 +92,17 @@ PLC_CONNECTION_TIMEOUT = 15  # 5 segundos de timeout
 PLC_READ_TIMEOUT = 10        # 3 segundos para lectura
 RECONNECT_DELAY = 10        # 10 segundos entre reconexiones fallidas
 
+# ═══════════════════════════ POOLS DE HILOS (I/O BLOQUEANTE) ═══════════════════════════
+# pymcprotocol y pyodbc son bloqueantes: si se llaman directo desde una corrutina
+# congelan el event loop entero y con él la lectura de TODOS los PLCs.
+# Estos executors los sacan del loop. Las conexiones se indexan por hilo, así que
+# dos hilos nunca comparten una conexión (ver ConnectionPool).
+PLC_IO_WORKERS = int(os.getenv('PLC_IO_WORKERS', '16'))  # 1 hilo por PLC concurrente
+DB_WORKERS = int(os.getenv('DB_WORKERS', '8'))           # limita conexiones SQL vivas
+
+_plc_executor = ThreadPoolExecutor(max_workers=PLC_IO_WORKERS, thread_name_prefix="plc-io")
+_db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="db")
+
 # ═══════════════════════════ POOL DE CONEXIONES ═══════════════════════════
 
 class ConnectionPool:
@@ -92,10 +116,19 @@ class ConnectionPool:
 
     @classmethod
     def get_sql_connection(cls):
-        """Obtiene o crea conexión SQL reutilizable"""
+        """
+        Obtiene o crea conexión SQL reutilizable, UNA POR HILO.
+
+        Antes existía una sola conexión global ("default_sql") compartida por todo
+        el sistema: los commit de una estación confirmaban el trabajo a medias de
+        otra, y en cuanto el I/O dejó de bloquear el loop esa conexión pasaría a
+        usarse concurrentemente (pyodbc no lo soporta). Indexar por hilo garantiza
+        que dos unidades de trabajo nunca compartan conexión, y acota el total al
+        tamaño de los executors.
+        """
         with cls._lock:
             current_time = datetime.now()
-            connection_key = "default_sql"
+            connection_key = f"sql_{threading.get_ident()}"
 
             # Limpiar conexiones antiguas periódicamente
             if hasattr(cls, '_last_cleanup'):
@@ -168,10 +201,10 @@ class ConnectionPool:
 
     @classmethod
     def get_as400_connection(cls):
-        """Obtiene o crea conexión AS400 reutilizable"""
+        """Obtiene o crea conexión AS400 reutilizable, UNA POR HILO (ver get_sql_connection)"""
         with cls._lock:
             current_time = datetime.now()
-            connection_key = "default_as400"
+            connection_key = f"as400_{threading.get_ident()}"
 
             # Reutilizar conexión existente si está disponible y válida
             if connection_key in cls._as400_pool:
@@ -323,10 +356,7 @@ def load_shifts_config() -> Dict[int, Dict]:
                 'name': name
             }
 
-        logger.info(f"✅ Turnos cargados: {len(shifts)} turnos")
-        for shift_id, data in shifts.items():
-            logger.info(f"   Turno {shift_id} ({data['name']}): {data['start'].strftime('%H:%M')} - {data['end'].strftime('%H:%M')}")
-
+        logger.debug(f"Turnos leídos: {len(shifts)}")
         return shifts
 
     except Exception as e:
@@ -335,14 +365,34 @@ def load_shifts_config() -> Dict[int, Dict]:
         return {}
     # NOTA: No cerramos la conexión aquí, el pool la maneja
 
+def _firma_turnos(cfg):
+    """Firma comparable de la configuración de turnos."""
+    return tuple(sorted(
+        (sid, d['start'].strftime('%H:%M'), d['end'].strftime('%H:%M'))
+        for sid, d in (cfg or {}).items()
+    ))
+
 def refresh_shifts_config():
-    """Recarga la configuración de turnos y actualiza variable global"""
+    """
+    Recarga los turnos y actualiza la variable global.
+
+    Corre en cada ciclo del supervisor (60 s) para que un cambio de horario en
+    la BD se tome solo, sin botón. Por eso SOLO registra en el log cuando algo
+    cambió de verdad: si no, serían ~5 760 líneas diarias sin información.
+    """
     global SHIFTS_CONFIG
     new_config = load_shifts_config()
 
     if new_config:
+        cambio = _firma_turnos(new_config) != _firma_turnos(SHIFTS_CONFIG)
         SHIFTS_CONFIG = new_config
-        logger.info("🔄 Configuración de turnos actualizada desde BD")
+        if cambio:
+            logger.info(f"🔄 Turnos actualizados desde BD: {len(new_config)} turno(s)")
+            for shift_id, data in sorted(new_config.items()):
+                logger.info(
+                    f"   Turno {shift_id} ({data['name']}): "
+                    f"{data['start'].strftime('%H:%M')} - {data['end'].strftime('%H:%M')}"
+                )
         return True
     else:
         logger.error("❌ No se pudo actualizar configuración de turnos")
@@ -358,50 +408,9 @@ def get_current_shift(current_time: time) -> Tuple[int, date]:
     Returns:
         Tuple[turno, fecha_plan]
     """
-    from datetime import date, timedelta
-
-    if not SHIFTS_CONFIG:
-        # Si no hay configuración, usar valores por defecto
-        if time(8, 0) <= current_time < time(20, 0):
-            return 1, date.today()
-        else:
-            turno = 2
-            fecha_plan = date.today() if current_time >= time(20, 0) else date.today() - timedelta(days=1)
-            return turno, fecha_plan
-
-    # Ordenar turnos por hora de inicio
-    sorted_shifts = sorted(SHIFTS_CONFIG.items(), key=lambda x: x[1]['start'])
-
-    # Si tenemos 2 turnos (el común)
-    if len(sorted_shifts) == 2:
-        shift1_id, shift1_data = sorted_shifts[0]
-        shift2_id, shift2_data = sorted_shifts[1]
-
-        # Turno 1: desde su inicio hasta antes del turno 2
-        if shift1_data['start'] <= current_time < shift2_data['start']:
-            turno = shift1_id
-            fecha_plan = date.today()
-        # Turno 2: desde su inicio hasta antes del turno 1 del siguiente día
-        elif current_time >= shift2_data['start']:
-            turno = shift2_id
-            fecha_plan = date.today()
-        else:  # Horas antes del inicio del turno 1 (pertenece al turno 2 del día anterior)
-            turno = shift2_id
-            fecha_plan = date.today() - timedelta(days=1)
-
-    else:
-        # Lógica para múltiples turnos
-        for shift_id, shift_data in sorted_shifts:
-            if shift_data['start'] <= current_time:
-                turno = shift_id
-                fecha_plan = date.today()
-                break
-        else:
-            # Si no encontramos, usar el último turno del día anterior
-            turno = sorted_shifts[-1][0]
-            fecha_plan = date.today() - timedelta(days=1)
-
-    return turno, fecha_plan
+    # La lógica vive en domain/turnos.py; aquí solo se le pasa el estado del
+    # entorno (configuración cargada de la BD y la fecha de hoy).
+    return _turnos.get_current_shift(current_time, SHIFTS_CONFIG, date.today())
 
 def has_shift_changed(previous_time: time, current_time: time) -> bool:
     """
@@ -414,16 +423,7 @@ def has_shift_changed(previous_time: time, current_time: time) -> bool:
     Returns:
         True si hubo cambio de turno
     """
-    if not SHIFTS_CONFIG:
-        # Sin configuración, usar horarios por defecto
-        return (previous_time < time(8, 0) <= current_time) or (previous_time < time(20, 0) <= current_time)
-
-    # Verificar si cruzamos el inicio de algún turno
-    for shift_data in SHIFTS_CONFIG.values():
-        if previous_time < shift_data['start'] <= current_time:
-            return True
-
-    return False
+    return _turnos.has_shift_changed(previous_time, current_time, SHIFTS_CONFIG)
 
 def safe_get_current_shift(current_time: time) -> Tuple[int, date]:
     """
@@ -597,68 +597,8 @@ def crear_conexion_as400(host: str = None, user: str = None,
     """Crea o reutiliza conexión a AS400 usando pool"""
     return ConnectionPool.get_as400_connection()
 
-# Cache para multiplicadores (evita consultas repetidas)
-_multiplicador_cache = {}
-_cache_lock = threading.RLock()
-_CACHE_TIMEOUT = 300  # 5 minutos
-
-def obtener_multiplicador_as400(numero_parte: str, estacion: str, estacion_logger=None) -> int:
-    """
-    Obtiene el multiplicador desde AS400 solo para el área de Estampado.
-    Para otras áreas, retorna 1 directamente.
-    CON CACHE para evitar consultas repetidas.
-    """
-    log = estacion_logger if estacion_logger else logger
-
-    # Verificar si la estación pertenece al área de Estampado
-    if estacion in system_monitor['estaciones']:
-        area = system_monitor['estaciones'][estacion].get('area', '').lower()
-
-        # Solo consultar AS400 si el área es 'estampado'
-        if 'estampado' not in area:
-            return 1
-    else:
-        return 1
-
-    # Verificar cache primero
-    cache_key = f"{numero_parte}_{estacion}"
-    current_time = datetime.now()
-
-    with _cache_lock:
-        if cache_key in _multiplicador_cache:
-            value, timestamp = _multiplicador_cache[cache_key]
-            # Verificar si el cache no ha expirado (5 minutos)
-            if (current_time - timestamp).total_seconds() < _CACHE_TIMEOUT:
-                log.debug(f"📦 Multiplicador desde cache: {value}")
-                return value
-
-        # No en cache o expirado, consultar AS400
-        conn_as400 = crear_conexion_as400()
-        if not conn_as400:
-            log.warning(f"No se pudo conectar a AS400 para {estacion}, usando multiplicador=1")
-            return 1
-
-        try:
-            cursor = conn_as400.cursor()
-            sql = "SELECT I.IUFD11 FROM LX834F01.IIU AS I WHERE RTRIM(I.IUPROD) = ? AND I.IUSEQN = 1"
-            cursor.execute(sql, (numero_parte,))
-            result = cursor.fetchone()
-
-            if result and result[0] is not None:
-                multiplicador = int(result[0])
-                # Guardar en cache
-                _multiplicador_cache[cache_key] = (multiplicador, current_time)
-                log.debug(f"✅ Multiplicador AS400 para {numero_parte}: {multiplicador}")
-                return multiplicador
-
-            log.debug(f"No se encontró multiplicador en AS400 para {numero_parte}, usando 1")
-            # Guardar 1 en cache también para no consultar repetidamente
-            _multiplicador_cache[cache_key] = (1, current_time)
-            return 1
-
-        except Exception as e:
-            log.error(f"Error consultando multiplicador en AS400: {e}")
-            return 1
+# El multiplicador ya no viene de AS400: sale de attributes.pieces_per_shot
+# en la misma consulta SQL. Ver persistence/catalogo.py
 
 # ═══════════════════════════ FUNCIONES BASE DE DATOS (COMUNES) ═══════════════════════════
 
@@ -752,103 +692,16 @@ def load_config():
         return {}
     # NOTA: No cerramos la conexión aquí, el pool la maneja
 
-def actualizar_registro(cursor, delta_produccion, fecha_fmt, record_id, status, log, start_fmt=None, necesita_start=False):
-    """
-    Suma el delta de producción al registro (modelo incremental).
-    La BD es la dueña del acumulado: produced_quantity = produced_quantity + delta.
-    Así, un reset de contador o una pérdida del state_cache nunca destruyen
-    lo ya registrado, y dos lados produciendo la misma parte suman sin pisarse.
-    """
-    sql_parts = ["produced_quantity = produced_quantity + ?", "production_end=?", "status_id=?"]
-    params = [delta_produccion, fecha_fmt, status]
+# El SQL vive en persistence/repositorio.py. Quién consulta el multiplicador lo
+# decide el ÁREA: solo Estampado lee pieces_per_shot (antes venía de AS400).
+def lector_multiplicador(pipeline):
+    """Devuelve la función que el repositorio usará para el multiplicador."""
+    if getattr(pipeline, 'usa_multiplicador', False):
+        return catalogo.obtener_multiplicador
+    return repo._sin_multiplicador
 
-    if start_fmt:
-        sql_parts.insert(0, "production_start=?")
-        params.insert(0, start_fmt)
-    elif necesita_start:
-        sql_parts.insert(0, "production_start=?")
-        params.insert(0, fecha_fmt)
-
-    sql = "UPDATE production_records SET " + ", ".join(sql_parts) + " WHERE id=?"
-    params.append(record_id)
-
-    cursor.execute(sql, tuple(params))
-
-def obtener_id_registro_activo(cursor, estacion, fecha_ajustada, turno, numero_parte, log):
-    sql = '''SELECT TOP(1) pr.id, pr.planned_quantity, pr.produced_quantity, pr.status_id, pr.production_start
-             FROM production_records pr
-             JOIN part_numbers pn ON pr.part_number_id = pn.id
-             JOIN work_centers wc ON pn.work_center_id = wc.id
-             WHERE wc.name=? AND REPLACE(pn.number, ' ', '')=? AND pr.planned_date=? AND pr.shift_id=? AND pr.status_id IN (3, 7, 8) AND pr.synced_to_infor != 1
-             ORDER BY pr.status_id DESC, pr.id DESC'''
-    cursor.execute(sql, (estacion, numero_parte, fecha_ajustada, turno))
-    res = cursor.fetchone()
-    if res:
-        mult = obtener_multiplicador_as400(numero_parte, estacion, log)
-        return res[0], res[1], res[2], res[3], res[4], mult
-    return None, None, None, None, None, None
-
-def crear_nuevo_registro(cursor, numero_parte, estacion, contador, turno, fecha_fmt, fecha_ajustada, num_orig, log):
-    #  NUEVO: Verificación previa para diagnóstico
-    try:
-        sql_check = """
-            SELECT pn.id, pn.number, wc.name, pn.is_obsolete
-            FROM part_numbers pn
-            JOIN work_centers wc ON pn.work_center_id = wc.id
-            WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=?
-        """
-        cursor.execute(sql_check, (numero_parte, estacion))
-        check_result = cursor.fetchone()
-
-        if check_result:
-            log.info(f"✅ Número de parte encontrado en BD: ID={check_result[0]}, number={check_result[1]}, estacion={check_result[2]}, obsolete={check_result[3]}")
-            if check_result[3] == 1:
-                log.warning(f"⚠️ El número de parte {numero_parte} está marcado como OBSOLETO")
-                return None, None, None, None, "PART_NUMBER_OBSOLETO"
-        else:
-            log.warning(f"⚠️ Número de parte {numero_parte} NO existe en part_numbers para estación {estacion}")
-            log.warning(f"   Intentando buscar sin remover espacios...")
-            # Intentar sin remover espacios
-            cursor.execute("SELECT pn.number FROM part_numbers pn JOIN work_centers wc ON pn.work_center_id = wc.id WHERE pn.number=? AND wc.name=?", (numero_parte, estacion))
-            alt_result = cursor.fetchone()
-            if alt_result:
-                log.info(f"   Encontrado con espacios: {alt_result[0]}")
-            else:
-                log.warning(f"   Tampoco encontrado con espacios originales")
-                return None, None, None, None, "PART_NUMBER_NO_EXISTE_BD"
-    except Exception as e:
-        log.error(f"Error en verificación previa: {e}")
-
-    sql = '''INSERT INTO production_records (part_number_id, produced_quantity, shift_id, production_start, status_id, planned_date)
-             OUTPUT INSERTED.id, INSERTED.planned_quantity, INSERTED.produced_quantity
-             SELECT pn.id, ?, ?, ?, 3, ? FROM part_numbers pn
-             JOIN work_centers wc ON pn.work_center_id = wc.id
-             WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=? AND pn.is_obsolete=0'''
-
-    try:
-        #  NUEVO: Logging detallado antes del insert
-        log.info(f"🔍 Intentando crear registro para: numero_parte={numero_parte}, estacion={estacion}, turno={turno}")
-
-        cursor.execute(sql, (contador, turno, fecha_fmt, fecha_ajustada, numero_parte, estacion))
-        res = cursor.fetchone()
-        if res:
-            mult = obtener_multiplicador_as400(numero_parte, estacion, log)
-            log.info(f"✅ Registro creado exitosamente: ID={res[0]}, numero_parte={numero_parte}")
-            return res[0], res[1], res[2], mult, None
-        else:
-            log.warning(f"⚠️ No se pudo crear registro para {numero_parte} - La consulta no retornó resultados")
-            log.warning(f"   Esto significa que el número de parte no existe en part_numbers o no está asociado a {estacion}")
-            return None, None, None, None, "SQL_NO_ENCONTRADO"
-    except Exception as e:
-        log.error(f"❌ Error crear registro para {numero_parte}: {e}")
-        log.error(f"   Parámetros: contador={contador}, turno={turno}, estacion={estacion}")
-        return None, None, None, None, "DB_ERROR"
-
-def obtener_part_number_id(cursor, numero_parte, estacion):
-    sql = "SELECT pn.id FROM part_numbers pn JOIN work_centers wc ON pn.work_center_id = wc.id WHERE REPLACE(pn.number, ' ', '')=? AND wc.name=?"
-    cursor.execute(sql, (numero_parte, estacion))
-    res = cursor.fetchone()
-    return res[0] if res else None
+obtener_id_registro_activo = repo.obtener_id_registro_activo
+crear_nuevo_registro = repo.crear_nuevo_registro
 
 # ═══════════════════════════ UTILS (STRING & BLOCK) ═══════════════════════════
 
@@ -910,47 +763,7 @@ def decodificar_bloque(bloque):
 
     return original, [limpia], {}
 
-def procesar_numero_parte(numero_plc):
-    """
-    Expande el número de parte del PLC en todas sus combinaciones.
-
-    El PLC puede condensar varios números en una sola cadena usando '/' como
-    separador de alternativas dentro de un segmento:
-
-        'DGH9 53 83 XB/ZB'  ->  ['DGH95383XB', 'DGH95383ZB']
-        'ABC 12/34 99'      ->  ['ABC1299', 'ABC3499']
-
-    Se divide primero por espacios (segmentos) y luego cada segmento por '/'
-    (alternativas); el producto cartesiano de los segmentos da las combinaciones.
-    Los espacios se eliminan del resultado para empatar con la comparación
-    REPLACE(pn.number, ' ', '') que usan las consultas contra part_numbers.
-
-    NO aplica a Estampado: esa área resuelve el MDI contra AS400 mediante
-    validar_numeros_parte_estampado().
-    """
-    if not numero_plc:
-        return []
-
-    segmentos = []
-    for seg in numero_plc.split(' '):
-        if not seg:
-            continue
-        # Alternativas del segmento, descartando vacías (p.ej. 'XB/' -> ['XB'])
-        alternativas = [alt for alt in seg.split('/') if alt]
-        if alternativas:
-            segmentos.append(alternativas)
-
-    if not segmentos:
-        return []
-
-    combinaciones = []
-    for combo in product(*segmentos):
-        nombre = ''.join(combo).replace(' ', '').strip()
-        # Dedup: 'AB/AB' no debe generar dos registros para el mismo número
-        if nombre and nombre not in combinaciones:
-            combinaciones.append(nombre)
-
-    return combinaciones
+# procesar_numero_parte vive ahora en domain/partes.py (importado arriba)
 
 # ═══════════════════════════ 🆕 NUEVA FUNCIÓN: VALIDACIÓN ESTAMPADO ═══════════════════════════
 
@@ -958,198 +771,52 @@ def procesar_numero_parte(numero_plc):
 # Estructura: {(estacion, mdi): [lista_de_numeros_parte_validados]}
 validacion_estampado_cache = {}
 
-def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> list:
+def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> tuple:
     """
-    Valida números de parte para el área de ESTAMPADO.
+    Traduce el MDI del troquel a los números de parte de esa estación.
 
-    Args:
-        mdi: Número MDI (receta del troquel) que viene del PLC
-        estacion: Nombre de la estación
-        log: Logger para la estación
+    Antes consultaba AS400 (LX834F01.IIU) y luego filtraba contra SQL Server.
+    Ahora sale todo de una sola consulta: el MDI vive en attributes.[key]='mid'.
+    Ver persistence/catalogo.py
 
-    Returns:
-        Lista de números de parte válidos para la estación
+    Devuelve (numeros_activos, error). El error va al tablero de rechazos y
+    distingue: MDI_NO_EXISTE, MDI_DE_OTRA_ESTACION, PART_NUMBER_OBSOLETO.
     """
-    # Crear clave de cache
     cache_key = (estacion, mdi)
-
-    # Si ya tenemos el resultado en cache, retornarlo
     if cache_key in validacion_estampado_cache:
-        log.info(f"✅ Usando cache para MDI={mdi} en {estacion}")
         return validacion_estampado_cache[cache_key]
 
-    log.info(f"🔍 Validando números de parte para MDI={mdi} en {estacion}")
-
-    # Conectar a AS400 para obtener los números de parte posibles
-    conn_as400 = crear_conexion_as400()
-    if not conn_as400:
-        log.error(f"❌ No se pudo conectar a AS400 para validar MDI={mdi}")
-        return []
-
-    numeros_parte_posibles = []
+    conn = create_connection()
+    if conn is None:
+        log.error(f"❌ Sin conexión a BD para resolver MDI={mdi}")
+        return [], "SIN_CONEXION_BD"
 
     try:
-        cursor_as400 = conn_as400.cursor()
-        # Consulta AS400 para obtener números de parte según el MDI
-        sql_as400 = "SELECT REPLACE(IUPROD, ' ', '') FROM LX834F01.IIU WHERE REPLACE(IUFD05, ' ', '') = ? AND IUSEQN = 2"
-
-        #  DEBUG: Mostrar consulta
-        mdi_sin_espacios = mdi.replace(' ', '')
-        log.info(f"   🔎 Consultando AS400 con MDI (sin espacios): '{mdi_sin_espacios}'")
-
-        cursor_as400.execute(sql_as400, (mdi_sin_espacios,))
-
-        rows = cursor_as400.fetchall()
-        numeros_parte_posibles = [row[0] for row in rows if row[0]]
-
-        log.info(f"📋 AS400 retornó {len(numeros_parte_posibles)} números de parte para MDI={mdi}")
-
-        #  DEBUG: Mostrar números encontrados
-        if numeros_parte_posibles:
-            log.info(f"   Números encontrados en AS400: {numeros_parte_posibles}")
-
+        with conn.cursor() as cursor:
+            numeros, _mults, error = catalogo.resolver_mdi(cursor, mdi, estacion, log)
     except Exception as e:
-        log.error(f"❌ Error consultando AS400 para MDI={mdi}: {e}")
-        return []
-    finally:
-        # NOTA: No cerramos la conexión aquí, el pool la maneja
-        pass
+        log.error(f"❌ Error resolviendo MDI={mdi}: {e}")
+        return [], "DB_ERROR"
 
-    # Si no hay números de parte posibles, retornar lista vacía (el error se consolida arriba)
-    if not numeros_parte_posibles:
-        log.warning(f"⚠️ No se encontraron números de parte para MDI={mdi} en AS400")
-        res = ([], "MDI_NO_ENCONTRADO_AS400")
-        validacion_estampado_cache[cache_key] = res
-        return res
-
-    # Ahora validar contra SQL Server para filtrar por estación
-    conn_sql = create_connection()
-    if not conn_sql:
-        log.error(f"❌ No se pudo conectar a SQL Server para validar MDI={mdi}")
-        return []
-
-    numeros_parte_validados = []
-
-    try:
-        cursor_sql = conn_sql.cursor()
-
-        # Crear placeholders para la consulta IN
-        placeholders = ','.join(['?' for _ in numeros_parte_posibles])
-
-        #  CORRECCIÓN: Limpiar espacios de los números de AS400 antes de comparar
-        numeros_sin_espacios = [num.replace(' ', '') for num in numeros_parte_posibles]
-
-        #  LOGGING: Mostrar números que se van a buscar
-        log.info(f"🔍 Buscando en SQL Server los siguientes números (sin espacios): {numeros_sin_espacios}")
-
-        # FIX: incluir is_obsolete para filtrar en este mismo paso y no depender
-        # de crear_nuevo_registro para rechazar obsoletos uno a uno.
-        sql_check = f"""
-            SELECT REPLACE(pn.number, ' ', ''), pn.is_obsolete FROM part_numbers pn
-            JOIN work_centers wc ON pn.work_center_id = wc.id
-            WHERE wc.name = ? AND REPLACE(pn.number, ' ', '') IN ({placeholders})
-        """
-
-        # Ejecutar consulta con números sin espacios
-        params = [estacion] + numeros_sin_espacios
-        cursor_sql.execute(sql_check, params)
-
-        rows = cursor_sql.fetchall()
-
-        # Separar todos los encontrados de los activos (no obsoletos)
-        todos_encontrados       = [row[0] for row in rows if row[0]]
-        obsoletos               = [row[0] for row in rows if row[0] and row[1] == 1]
-        numeros_parte_validados = [row[0] for row in rows if row[0] and row[1] != 1]
-
-        log.info(f"✅ SQL Server validó {len(todos_encontrados)} números de parte para estación {estacion}")
-        log.info(f"   Números encontrados (total): {todos_encontrados}")
-
-        if obsoletos:
-            log.warning(
-                f"⚠️ Filtrados {len(obsoletos)} número(s) OBSOLETO(S) en validación de MDI={mdi} "                f"estacion={estacion}: {obsoletos}. Solo se usarán los activos: {numeros_parte_validados}"
-            )
-
-        if numeros_parte_validados:
-            log.info(f"   Números activos (no obsoletos): {numeros_parte_validados}")
-        else:
-            log.warning(f"   Números buscados: {numeros_sin_espacios}")
-            log.warning(f"   Números encontrados: NINGUNO activo")
-
-        # Si todos eran obsoletos o no existían en SQL, retornar vacío con motivo detallado
-        if not numeros_parte_validados:
-            if obsoletos and not (set(todos_encontrados) - set(obsoletos)):
-                log.warning(
-                    f"⚠️ Todos los números para MDI={mdi} en {estacion} son OBSOLETOS: {obsoletos}"
-                )
-                res = ([], "TODOS_OBSOLETOS")
-            else:
-                numeros_str = ", ".join(numeros_parte_posibles[:5])
-                if len(numeros_parte_posibles) > 5:
-                    numeros_str += f" (y {len(numeros_parte_posibles)-5} más)"
-                log.warning(
-                    f"⚠️ AS400 retornó {len(numeros_parte_posibles)} números pero ninguno válido "                    f"para estación {estacion}. MDI={mdi}, números={numeros_str}"
-                )
-                res = ([], "NUMEROS_NO_VALIDOS_ESTACION_SQL")
-            validacion_estampado_cache[cache_key] = res
-            return res
-
-    except Exception as e:
-        log.error(f"❌ Error validando en SQL Server para MDI={mdi}: {e}")
-        # En caso de error de conexión o consulta, no bloquear AS400
-        return ([], "ERROR_CONSULTA_SQL_SERVER")
-    finally:
-        # NOTA: No cerramos la conexión aquí, el pool la maneja
-        pass
-
-    res = (numeros_parte_validados, None)
-    # Guardar en cache
-    validacion_estampado_cache[cache_key] = res
-
-    return res
+    resultado = (numeros, error)
+    validacion_estampado_cache[cache_key] = resultado
+    return resultado
 
 # ═══════════════════════════ PATRONES STRATEGY & FACTORY ═══════════════════════════
 
-class DBStrategy(ABC):
-    """Estrategia base para operaciones de BD específicas por área"""
-    def __init__(self, logger):
-        self.log = logger
-
-    @abstractmethod
-    def insertar_history(self, cursor, part_number_id, cantidad, fecha_fmt, tiempo, extras=None):
-        pass
-
-class DefaultStrategy(DBStrategy):
-    """Estrategia por defecto (Carrocería, Ensamble, etc.)"""
-    def insertar_history(self, cursor, part_number_id, cantidad, fecha_fmt, tiempo, extras=None):
-        sql = '''INSERT INTO histories (part_number_id, quantity, created_at, production_per_cycle) VALUES (?, ?, ?, ?)'''
-        try:
-            cursor.execute(sql, (part_number_id, cantidad, fecha_fmt, tiempo))
-        except Exception as e:
-            self.log.error(f"Error insert history: {e}")
-
-class EstampadoStrategy(DBStrategy):
+def registrar_history(cursor, pipeline, part_number_id, cantidad, fecha_fmt, tiempo, dato, log):
     """
-    Estrategia para Estampado.
-    Recibe el 'Troquel ID' y lo guarda en la columna 'sequence'.
-    """
-    def insertar_history(self, cursor, part_number_id, cantidad, fecha_fmt, tiempo, extras=None):
-        troquel_id = extras.get('troquel_id', 0) if extras else 0
-        sql = '''INSERT INTO histories (part_number_id, quantity, created_at, production_per_cycle, sequence) VALUES (?, ?, ?, ?, ?)'''
-        try:
-            cursor.execute(sql, (part_number_id, cantidad, fecha_fmt, tiempo, troquel_id))
-        except Exception as e:
-            self.log.error(f"Error insert history estampado: {e}")
+    Inserta el detalle en histories con las columnas extra que decida el área.
 
-class DBStrategyFactory:
-    """Fábrica que decide qué estrategia usar según el nombre del área"""
-    @staticmethod
-    def get_strategy(area_name, logger):
-        if not area_name: return DefaultStrategy(logger)
-        nombre = str(area_name).lower().strip()
-        if "estampado" in nombre:
-            return EstampadoStrategy(logger)
-        else:
-            return DefaultStrategy(logger)
+    Estampado agrega `sequence` con el troquel; las demás áreas no agregan nada.
+    Antes esto vivía en una jerarquía DBStrategy paralela al pipeline de área;
+    ahora el área es una sola cosa (ver areas/).
+    """
+    try:
+        repo.insertar_history(cursor, part_number_id, cantidad, fecha_fmt, tiempo,
+                              **pipeline.extras_history(dato or {}))
+    except Exception as e:
+        log.error(f"Error insert history: {e}")
 
 # ═══════════════════════════ RECOLECTOR DINÁMICO ═══════════════════════════
 
@@ -1158,6 +825,8 @@ class IPDataCollector:
         self.ip = ip
         self.estaciones = estaciones
         self.area = area
+        # El pipeline del área se resuelve una vez, no en cada lectura.
+        self._pipeline = obtener_pipeline(area)
 
     def _parse_tag(self, tag_name):
         """Detecta tipo y grupo del tag (ej: 'Contador RH' -> 'contador', 'RH')"""
@@ -1330,90 +999,60 @@ class IPDataCollector:
             partes = data.get('parte', {'orig': '', 'list': [], 'meta': {}})
             troquel_id = data.get('troquel', None)
 
-            # 🆕 NUEVO: Si es área de ESTAMPADO y tenemos un número original (MDI)
-            if "estampado" in str(self.area).lower() and partes['orig'] and partes['orig'].strip():
-                mdi = partes['orig'].strip()
+            # El área decide cómo se traduce lo que manda el PLC a números de
+            # parte. Estampado resuelve el MDI contra AS400; las demás expanden
+            # las alternativas con '/'. Ver areas/
+            raw = partes.get('orig') or ''
+            ctx_area = ContextoArea(
+                estacion=estacion, log=log,
+                validar_estampado=validar_numeros_parte_estampado,
+            )
+            nombres_parte, error_parte = self._pipeline.resolver_partes(raw, ctx_area)
 
-                # Validar números de parte usando la nueva función
-                numeros_validados, error_reason = validar_numeros_parte_estampado(mdi, estacion, log)
-
-                #  NUEVO: Logging detallado de lo que se encontró
-                log.info(f"📦 Procesando estampado: MDI={mdi}, estacion={estacion}")
-                log.info(f"   Números validados: {numeros_validados}")
-                log.info(f"   Contador actual: {data['contador']}, Troquel: {troquel_id}")
-
-                if numeros_validados:
-                    # Agregar cada número de parte validado con su contador
-                    for num_parte in numeros_validados:
-                        datos_estacion.append({
-                            'parte': num_parte,
-                            'original': partes['orig'],
-                            'contador': data['contador'],
-                            'tiempo': data.get('tiempo', 0.0),
-                            'troquel_id': troquel_id,
-                            'validado': True,
-                            'lado': grp  # 🆕 Identificar el lado/grupo
-                        })
-                    log.info(f"✅ Agregados {len(numeros_validados)} números de parte validados a datos_estacion")
-                else:
-                    # No se encontraron números de parte válidos
-                    log.warning(f"❌ No se encontraron números válidos para MDI={mdi}")
-                    log.warning(f"   Se agregará como NO VALIDADO para que aparezca en la interfaz")
-
-                    error_msg = error_reason if error_reason else 'NO_PART_NUMBER_ESTAMPADO'
-
-                    datos_estacion.append({
-                        'parte': None,
-                        'original': partes['orig'],
-                        'contador': data['contador'],
-                        'tiempo': data.get('tiempo', 0.0),
-                        'troquel_id': troquel_id,
-                        'validado': False,
-                        'error_validacion': error_msg,
-                        'lado': grp  # 🆕 Identificar el lado/grupo
-                    })
-            else:
-                # Otras áreas: expandir el número del PLC en sus combinaciones.
-                # Un solo contador puede corresponder a varios números de parte
-                # (p.ej. 'DGH9 53 83 XB/ZB' -> DGH95383XB y DGH95383ZB); cada uno
-                # lleva el MISMO contador y sigue su propio proceso/registro.
-                nombres_parte = procesar_numero_parte(partes['orig'])
+            if nombres_parte:
+                # requiere_validacion_bd: en Estampado el número ya se validó
+                # contra AS400 y part_numbers, así que entra como validado.
+                validado_flag = None if self._pipeline.requiere_validacion_bd() else True
 
                 if len(nombres_parte) > 1:
                     log.info(
-                        f"🔀 Número de parte expandido en {estacion}/{grp}: "
-                        f"'{partes['orig']}' -> {nombres_parte} (contador={data['contador']})"
+                        f"🔀 {estacion}/{grp} [{self._pipeline.nombre}]: "
+                        f"'{raw}' -> {nombres_parte} (contador={data['contador']})"
                     )
 
-                if nombres_parte:
-                    for p_nombre in nombres_parte:
-                        datos_estacion.append({
+                for p_nombre in nombres_parte:
+                    datos_estacion.append({
                         'parte': p_nombre,
                         'original': partes['orig'],
                         'contador': data['contador'],
                         'tiempo': data.get('tiempo', 0.0),
                         'troquel_id': troquel_id,
-                        'validado': None,  # ⏳ Era True, se forzó a None para requerir validación DB
+                        'validado': validado_flag,
                         'error_validacion': None,
                         'lado': grp  # 🆕 Identificar el lado/grupo
                     })
-                elif partes['orig'] and partes['orig'].strip():
-                    datos_estacion.append({
-                        'parte': None,
-                        'original': partes['orig'],
-                        'contador': data['contador'],
-                        'tiempo': data.get('tiempo', 0.0),
-                        'troquel_id': troquel_id,
-                        'validado': False,
-                        'error_validacion': 'NO_PART_NUMBER',
-                        'lado': grp  # 🆕 Identificar el lado/grupo
-                    })
+            elif raw.strip():
+                log.warning(
+                    f"❌ {estacion}/{grp} [{self._pipeline.nombre}]: no se resolvió "
+                    f"ningún número de parte para '{raw}' ({error_parte})"
+                )
+                datos_estacion.append({
+                    'parte': None,
+                    'original': partes['orig'],
+                    'contador': data['contador'],
+                    'tiempo': data.get('tiempo', 0.0),
+                    'troquel_id': troquel_id,
+                    'validado': False,
+                    'error_validacion': error_parte,
+                    'lado': grp  # 🆕 Identificar el lado/grupo
+                })
 
         return datos_estacion
 
     async def collect_and_enqueue(self, plc, group_info, _blocks=None):
         """Método optimizado con lectura merge-batchread por bloques."""
         try:
+            loop = asyncio.get_running_loop()
             blocks = _blocks if _blocks is not None else list(group_info.get('all_addresses', []))
             merged_reqs = self._merge_blocks(blocks, max_gap=15)
             block_data = {}
@@ -1421,7 +1060,14 @@ class IPDataCollector:
                 head = req['head']
                 length = req['len']
                 try:
-                    vals = plc.batchread_wordunits(headdevice=head, readsize=length)
+                    # batchread_wordunits es una llamada de socket BLOQUEANTE: se ejecuta
+                    # en un hilo para no congelar la lectura del resto de los PLCs.
+                    # Las lecturas de un mismo PLC siguen siendo secuenciales (await),
+                    # que es lo que exige pymcprotocol.
+                    vals = await loop.run_in_executor(
+                        _plc_executor,
+                        functools.partial(plc.batchread_wordunits, headdevice=head, readsize=length)
+                    )
                     if not vals or len(vals) < length:
                         received = len(vals) if vals else 0
                         logger.warning(f"⚠️ batchread_wordunits devolvió {received}/{length} words para '{head}' en PLC {self.ip}.")
@@ -1510,57 +1156,14 @@ class IPDataProcessor:
         self.load_state()
 
     def load_state(self):
-        """Carga el estado previo desde el archivo JSON específico para esta IP."""
-        if not self.state_file.exists():
-            return
-
-        try:
-            with open(self.state_file, 'r') as f:
-                data = json.load(f)
-
-            for clave, record in data.items():
-                try:
-                    h_str = record.get('hora_cambio', '00:00:00')
-                    h_obj = datetime.strptime(h_str, "%H:%M:%S").time()
-                    record['hora_cambio'] = h_obj
-
-                    # 🛡️ MIGRACIÓN DE JSON ANTIGUO: Añadir '_GLOBAL' si la llave no tiene lado
-                    if not any(clave.endswith(suf) for suf in ['_GLOBAL', '_RH', '_LH', '_RH REAR', '_LH REAR', '_--']):
-                        clave = f"{clave}_GLOBAL"
-
-                    #  RESTAURAR número original desde el estado
-                    if 'numero_original' not in record:
-                        # Intentar inferir del número validado (para compatibilidad)
-                        validated_part = clave.split('_', 1)[1] if '_' in clave else ''
-                        record['numero_original'] = validated_part
-
-                    self.active_records[clave] = record
-                except Exception as e:
-                    logger.error(f"Error al deserializar registro {clave}: {e}")
-                    continue
-
-            logger.info(f"Estado recuperado para {self.ip}: {len(self.active_records)} registros cargados.")
-        except Exception as e:
-            logger.error(f"Error cargando estado para {self.ip}: {e}")
+        """Carga el estado previo. La lectura vive en persistence/estado.py"""
+        self.active_records = estado_store.cargar_estado(self.state_file, self.ip)
 
     def save_state(self):
-        """Guarda el estado actual en JSON específico para esta IP."""
-        try:
-            serializable_data = {}
-            for clave, record in self.active_records.items():
-                rec_copy = record.copy()
-                if isinstance(rec_copy.get('hora_cambio'), time):
-                    rec_copy['hora_cambio'] = rec_copy['hora_cambio'].strftime("%H:%M:%S")
-                if rec_copy.get('id_registro') is None:
-                    rec_copy['id_registro'] = 0
-                serializable_data[clave] = rec_copy
+        """Guarda el estado. La escritura atómica vive en persistence/estado.py"""
+        estado_store.guardar_estado(self.state_file, self.active_records, self.ip)
 
-            with open(self.state_file, 'w') as f:
-                json.dump(serializable_data, f, indent=4)
-        except Exception as e:
-            logger.error(f"Error guardando estado para {self.ip}: {e}")
-
-    def _ensure_active_record(self, cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, contador_previo=None, lado='--'):
+    def _ensure_active_record(self, cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, pipeline, contador_previo=None, lado='--'):
         """
         Garantiza que exista un registro activo (Status 7) para la estación y parte.
         Modelo incremental: la BD es la dueña del acumulado (produced_quantity);
@@ -1571,8 +1174,10 @@ class IPDataProcessor:
           turno anterior; el avance (cnt - contador_previo) es la producción
           inicial del nuevo registro.
         """
+        leer_mult = lector_multiplicador(pipeline)
+
         id_reg, q_plan, q_prod, status, prod_start_db, mult = obtener_id_registro_activo(
-            cursor, estacion, fecha_plan, turno, num, log
+            cursor, estacion, fecha_plan, turno, num, log, leer_mult
         )
 
         mult = mult or 1
@@ -1597,15 +1202,14 @@ class IPDataProcessor:
             if contador_previo is not None:
                 # Cambio de turno: la producción inicial es el avance desde el
                 # contador con que cerró el turno anterior.
-                delta_inicial = cnt - contador_previo
-                if delta_inicial < 0:
+                delta_inicial, fue_negativo = calcular_delta_turno(contador_previo, cnt)
+                if fue_negativo:
                     log.warning(
                         f"⚠️ Cambio de turno con delta negativo detectado en {estacion}/{num}/{lado}: "
                         f"cnt_actual={cnt}, contador_previo_turno={contador_previo}, mult={mult}. "
                         f"Se fuerza qty_inicial=0 para evitar negativos en production_records."
                     )
-                    delta_inicial = 0
-                qty_inicial = delta_inicial * mult
+                qty_inicial = piezas_producidas(delta_inicial, mult)
 
                 log.info(
                     f"🕒 Nuevo registro por cambio de turno en {estacion}/{num}/{lado}: "
@@ -1615,12 +1219,13 @@ class IPDataProcessor:
             else:
                 # Parte nueva: el contador actual del PLC pertenece a esta corrida.
                 if mult == 1:
-                    mult = obtener_multiplicador_as400(num, estacion, log) or 1
+                    mult = leer_mult(cursor, num, estacion, log) or 1
                 delta_inicial = cnt
-                qty_inicial = cnt * mult
+                qty_inicial = piezas_producidas(cnt, mult)
 
             id_reg, q_plan, q_prod, mult_new, error_bd = crear_nuevo_registro(
-                cursor, num, estacion, qty_inicial, turno, fecha_fmt, fecha_plan, num_orig, log
+                cursor, num, estacion, qty_inicial, turno, fecha_fmt, fecha_plan, num_orig, log,
+                leer_mult
             )
 
             if id_reg is None:
@@ -1642,7 +1247,7 @@ class IPDataProcessor:
         # del contador actual del PLC (haya reset o no).
         if status == 8:
             try:
-                cursor.execute("UPDATE production_records SET status_id = 7 WHERE id = ? AND status_id = 8", (id_reg,))
+                repo.reactivar_registro(cursor, id_reg)
                 log.info(
                     f"✅ Registro {id_reg} reactivado (status 8 → 7). "
                     f"Acumulado BD preservado: {q_prod or 0}. Conteo continúa desde cnt={cnt}."
@@ -1671,29 +1276,55 @@ class IPDataProcessor:
 
     async def process_continuously(self):
         if self.ip not in ip_data_queues: return
+        loop = asyncio.get_running_loop()
         while True:
             try:
-                #  MODIFICACIÓN: Procesar todo el batch de una vez
                 batch = await ip_data_queues[self.ip].get()
 
-                #  NUEVO: Procesar todas las estaciones del batch concurrentemente
-                # pero con un semáforo para no saturar la BD
-                semaphore = asyncio.Semaphore(10)  # Máximo 10 estaciones simultáneas
-
-                async def process_with_semaphore(pkg):
-                    async with semaphore:
-                        await self._process_estacion(pkg)
-
-                tasks = [process_with_semaphore(pkg) for pkg in batch]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                # Todo el batch corre en UN hilo del pool de BD.
+                # Antes se lanzaban corrutinas "concurrentes" con un semáforo, pero
+                # como ninguna cedía el control (pyodbc es bloqueante) corrían en
+                # serie de todos modos, congelando el event loop mientras tanto.
+                # Un hilo por batch mantiene el loop libre y deja active_records
+                # bajo un solo hilo a la vez, sin necesidad de locks.
+                await loop.run_in_executor(_db_executor, self._process_batch, batch)
 
                 ip_data_queues[self.ip].task_done()
 
+            except asyncio.CancelledError:
+                logger.info(f"🛑 Procesador de {self.ip} detenido")
+                raise
+            except RuntimeError as e:
+                # El intérprete está apagando los executors (cierre de la app):
+                # seguir intentando solo genera ruido y nunca va a funcionar.
+                if 'shutdown' in str(e).lower():
+                    logger.info(f"🛑 Procesador de {self.ip} detenido: el pool de hilos se cerró")
+                    return
+                logger.error(f"Error en loop de procesamiento para {self.ip}: {e}")
+                await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Error en loop de procesamiento para {self.ip}: {e}")
                 await asyncio.sleep(0.5)
 
-    async def _process_estacion(self, pkg):
+    def _process_batch(self, batch):
+        """Procesa secuencialmente las estaciones de un batch. Corre en hilo de BD."""
+        hubo_cambios = False
+        for pkg in batch:
+            try:
+                if self._process_estacion(pkg):
+                    hubo_cambios = True
+            except Exception as e:
+                est = pkg.get('estacion', '?')
+                logger.error(f"Error procesando {est} en {self.ip}: {e}")
+                logger.error(traceback.format_exc())
+
+        # Un solo guardado por batch. Antes se escribía el archivo completo de la IP
+        # una vez POR ESTACIÓN, así que con muchas estaciones se reescribía decenas
+        # de veces por ciclo; ahora es una sola vez, lo que paga el costo del fsync.
+        if hubo_cambios:
+            self.save_state()
+
+    def _process_estacion(self, pkg):
         estacion = pkg['estacion']
         datos = pkg['datos']
         area = pkg.get('area', 'Default')
@@ -1708,7 +1339,7 @@ class IPDataProcessor:
             log.error("❌ No se pudo obtener conexión a BD para procesar estación")
             return
 
-        db_strategy = DBStrategyFactory.get_strategy(area, log)
+        pipeline = obtener_pipeline(area)
 
         state_changed = False
 
@@ -1737,13 +1368,7 @@ class IPDataProcessor:
                         return
 
                     # Lectura buena y sin partes: la estación sí dejó de producir.
-                    cursor.execute("""
-                        UPDATE pr SET pr.status_id = 8, pr.production_end=?
-                        FROM production_records pr
-                        JOIN part_numbers pn ON pr.part_number_id = pn.id
-                        JOIN work_centers wc ON pn.work_center_id = wc.id
-                        WHERE wc.name=? AND pr.planned_date=? AND pr.shift_id=? AND pr.status_id=7
-                    """, (fecha_fmt, estacion, fecha_plan, turno))
+                    repo.cerrar_registros_de_estacion(cursor, estacion, fecha_plan, turno, fecha_fmt)
 
                     keys_to_delete = [k for k in self.active_records if k.startswith(f"{estacion}_")]
                     for k in keys_to_delete:
@@ -1751,8 +1376,7 @@ class IPDataProcessor:
                         state_changed = True
 
                     conn.commit()
-                    if state_changed: self.save_state()
-                    return
+                    return state_changed
 
                 claves_actuales_en_plc = set()
                 for d in datos:
@@ -1775,10 +1399,7 @@ class IPDataProcessor:
                         record_id = self.active_records[k].get('id_registro')
                         if record_id:
                              try:
-                                cursor.execute(
-                                    "UPDATE production_records SET status_id = 8, production_end=? WHERE id=? AND status_id=7",
-                                    (fecha_fmt, record_id)
-                                )
+                                repo.cerrar_registro(cursor, record_id, fecha_fmt)
                              except Exception as e:
                                 log.error(f"Error cerrando registro obsoleto {record_id}: {e}")
 
@@ -1804,6 +1425,28 @@ class IPDataProcessor:
 
                     # 🚀 OPTIMIZACIÓN DE POLLEO: Si la pieza y contador son idénticos al milisegundo anterior, saltamos validación SQL
                     if previous_state and previous_state["parte_original"] == num_orig and previous_state["contador"] == cnt:
+                        # El contador está congelado, pero si ya cruzamos la frontera de
+                        # turno hay que CERRAR el registro del turno anterior: de lo
+                        # contrario se queda abierto indefinidamente en el turno que ya pasó.
+                        # El registro del turno nuevo NO se crea aquí a propósito: nacerá
+                        # cuando haya producción real, porque hora_cambio no se actualiza
+                        # y el bloque de cambio de turno volverá a dispararse entonces.
+                        _reg_frio = self.active_records.get(f"{estacion}_{num}_{lado_actual}")
+                        if (_reg_frio and _reg_frio.get('id_registro')
+                                and not _reg_frio.get('cerrado_por_turno')
+                                and has_shift_changed(_reg_frio['hora_cambio'], hora)):
+                            try:
+                                repo.cerrar_registro(cursor, _reg_frio['id_registro'], fecha_fmt)
+                                _reg_frio['cerrado_por_turno'] = True
+                                conn.commit()
+                                state_changed = True
+                                log.info(
+                                    f"🕒 Registro {_reg_frio['id_registro']} cerrado en el cambio de turno "
+                                    f"({estacion}/{num}/{lado_actual}) con el contador detenido en {cnt}. "
+                                    f"El registro del turno nuevo se creará cuando haya producción."
+                                )
+                            except Exception as e:
+                                log.error(f"Error cerrando registro por turno con contador detenido: {e}")
                         continue  # El UI ya preservó el estado visual, evitamos saturar SQL Server y CSVs
 
                     # Si es nuevo o ha cambiado, actualizamos nuestro caché antes del procesamiento pesado
@@ -1826,7 +1469,7 @@ class IPDataProcessor:
                     clave = f"{estacion}_{num}_{d.get('lado', '--')}"  # 🆕 CLAVE POR LADO
 
                     if clave not in self.active_records:
-                        new_record = self._ensure_active_record(cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, lado=d.get('lado', '--'))
+                        new_record = self._ensure_active_record(cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt, pipeline, lado=d.get('lado', '--'))
                         
                         if new_record and new_record.get('error_bd'):
                             error_bd = new_record['error_bd']
@@ -1855,9 +1498,9 @@ class IPDataProcessor:
                                 if pid_nuevo:
                                     extras_ini = {'troquel_id': troquel_id}
                                     try:
-                                        db_strategy.insertar_history(
-                                            cursor, pid_nuevo, _delta_inicial, fecha_fmt,
-                                            d.get('tiempo', 0.0), extras_ini
+                                        registrar_history(
+                                            cursor, pipeline, pid_nuevo, _delta_inicial,
+                                            fecha_fmt, d.get('tiempo', 0.0), extras_ini, log
                                         )
                                         log.info(
                                             f"📝 History inicial registrado al crear nuevo registro {num}: "
@@ -1894,10 +1537,7 @@ class IPDataProcessor:
                         )
 
                         try:
-                            cursor.execute(
-                                "UPDATE production_records SET status_id = 8, production_end=? WHERE id=? AND status_id=7",
-                                (fecha_fmt, old_id)
-                            )
+                            repo.cerrar_registro(cursor, old_id, fecha_fmt)
                             log.info(f"✅ Registro anterior cerrado por cambio de turno: id={old_id}, production_end={fecha_fmt}")
                         except Exception as e:
                             log.error(f"Error cerrando registro {old_id}: {e}")
@@ -1918,12 +1558,15 @@ class IPDataProcessor:
                         # Crear/obtener el registro del NUEVO turno.
                         new_reg_data = self._ensure_active_record(
                             cursor, estacion, fecha_plan, turno, num, num_orig, cnt, log, fecha_fmt,
-                            contador_previo=prev_counter,
+                            pipeline, contador_previo=prev_counter,
                             lado=d.get('lado', '--')
                         )
 
                         if new_reg_data and new_reg_data.get('id_registro'):
                             reg.update(new_reg_data)
+                            # Ya hay registro del turno nuevo: se limpia la marca de
+                            # "cerrado con el contador detenido" para el siguiente turno.
+                            reg.pop('cerrado_por_turno', None)
                             log.info(
                                 f"✅ Nuevo estado tras cambio de turno en {estacion}/{num}/{d.get('lado', '--')}: "
                                 f"nuevo_id={reg.get('id_registro')}, "
@@ -1954,9 +1597,9 @@ class IPDataProcessor:
                                 if _pid_ct:
                                     _extras_ct = {'troquel_id': troquel_id}
                                     try:
-                                        db_strategy.insertar_history(
-                                            cursor, _pid_ct, delta_turno, fecha_fmt,
-                                            d.get('tiempo', 0.0), _extras_ct
+                                        registrar_history(
+                                            cursor, pipeline, _pid_ct, delta_turno,
+                                            fecha_fmt, d.get('tiempo', 0.0), _extras_ct, log
                                         )
                                         log.info(
                                             f"📝 History cambio de turno: {num} "
@@ -1989,19 +1632,14 @@ class IPDataProcessor:
 
                         # MODELO INCREMENTAL: solo se calcula el delta de golpes desde
                         # la última lectura; la BD acumula (produced_quantity += delta).
-                        if cnt >= prev:
-                            incremento_ciclo = cnt - prev
-                        else:
-                            # Reset del contador (fin de corrida y reinicio con la misma
-                            # parte): lo producido antes del reset ya está acumulado en
-                            # BD; el contador nuevo son golpes de la corrida nueva.
+                        incremento_ciclo, hubo_reset = calcular_incremento(prev, cnt)
+                        if hubo_reset:
                             log.warning(
                                 f"⚠️ Reset detectado en {num}: {prev} -> {cnt}. "
                                 f"Acumulado en BD intacto; se suma el contador nuevo como delta."
                             )
-                            incremento_ciclo = cnt
 
-                        delta_produccion = incremento_ciclo * multiplicador
+                        delta_produccion = piezas_producidas(incremento_ciclo, multiplicador)
 
                         necesita_start = reg.get('necesita_production_start', False)
 
@@ -2021,7 +1659,8 @@ class IPDataProcessor:
                             # En histories se guarda el incremento de golpes sin multiplicar
                             # (mismo comportamiento para estampado y área general)
                             if incremento_ciclo > 0:
-                                db_strategy.insertar_history(cursor, pid, incremento_ciclo, fecha_fmt, tiempo, extras)
+                                registrar_history(cursor, pipeline, pid, incremento_ciclo,
+                                                  fecha_fmt, tiempo, extras, log)
 
                         if necesita_start:
                             reg['necesita_production_start'] = False
@@ -2031,14 +1670,14 @@ class IPDataProcessor:
                         state_changed = True
 
                 conn.commit()
-
-                if state_changed:
-                    self.save_state()
+                return state_changed
 
         except Exception as e:
             log.error(f"❌ Error procesando {estacion}: {e}")
             log.error(traceback.format_exc())
         # NOTA: No cerramos la conexión aquí, el pool la maneja
+        # El guardado del estado lo hace _process_batch, una vez por batch.
+        return False
 
 # ═══════════════════════════ ASYNCIO & MAIN LOOPS ═══════════════════════════
 
@@ -2083,8 +1722,16 @@ async def connect_plc_with_timeout(plc, ip, port, timeout=PLC_CONNECTION_TIMEOUT
         return False
 
 async def plc_reader(ip, port, group_info):
-    """Lector optimizado para PLC con manejo de errores mejorado"""
+    """
+    Lector del PLC.
 
+    `group_info` es el dict VIVO que mantiene el supervisor: cuando cambia la
+    configuración de esta IP, el supervisor lo actualiza en su lugar y sube
+    '_version'. Aquí se detecta y se reconstruye el colector sin cerrar la
+    conexión al PLC, así que las estaciones de las demás IPs ni se enteran.
+    """
+
+    version_config = group_info.get('_version', 0)
     collector = IPDataCollector(ip, group_info['estaciones'], group_info.get('area', 'Default'))
 
     if ip not in ip_data_queues:
@@ -2117,6 +1764,30 @@ async def plc_reader(ip, port, group_info):
 
     while True:
         try:
+            # ¿Cambió la configuración de esta IP desde el último ciclo?
+            if group_info.get('_version', 0) != version_config:
+                version_config = group_info.get('_version', 0)
+                collector = IPDataCollector(
+                    ip, group_info['estaciones'], group_info.get('area', 'Default')
+                )
+                addrs = list(group_info.get('all_addresses', []))
+
+                nuevo_puerto = group_info.get('port', port)
+                if nuevo_puerto != port:
+                    # El puerto sí obliga a reconectar; los tags no.
+                    logger.info(f"🔌 {ip}: el puerto cambió {port} → {nuevo_puerto}, reconectando")
+                    port = nuevo_puerto
+                    try: plc.close()
+                    except Exception: pass
+                    connected = False
+                    plc = create_plc_instance()
+                else:
+                    logger.info(
+                        f"♻️ {ip}: configuración recargada (v{version_config}) "
+                        f"sin cerrar la conexión — {len(addrs)} bloque(s), "
+                        f"{len(group_info['estaciones'])} estación(es)"
+                    )
+
             if not connected:
                 logger.info(f"🔌 Intentando conectar a PLC {ip}:{port}")
 
@@ -2215,21 +1886,52 @@ async def plc_reader(ip, port, group_info):
             plc = create_plc_instance()
             await asyncio.sleep(RECONNECT_DELAY)
 
+def _huella_config(group_info):
+    """
+    Firma del contenido relevante de una IP. Si cambia, hay que recargar.
+    Se ignora '_version' para no compararse consigo misma.
+    """
+    relevante = {
+        'port': group_info.get('port'),
+        'serie': group_info.get('serie'),
+        'area': group_info.get('area'),
+        'estaciones': sorted(group_info.get('estaciones', [])),
+        'all_addresses': sorted(map(str, group_info.get('all_addresses', []))),
+        'station_configs': {
+            est: sorted((t, str(v.get('address')), v.get('long'))
+                        for t, v in cfg.items())
+            for est, cfg in sorted(group_info.get('station_configs', {}).items())
+        },
+    }
+    return hashlib.md5(str(relevante).encode()).hexdigest()
+
+
 async def supervisor():
     tasks = {}
+    configs_vivas = {}   # ip -> group_info mutable compartido con su lector
     last_successful_config = {}
     config_failures = 0
     max_config_failures = 5
     last_status_log = datetime.now()
 
-    # 🔄 Cargar turnos al inicio
-    refresh_shifts_config()
+    loop = asyncio.get_running_loop()
+
+    # 🔄 Cargar turnos al inicio (consulta bloqueante → hilo)
+    await loop.run_in_executor(_db_executor, refresh_shifts_config)
+
+    # Dejar asentado en qué base se está escribiendo: al correr en paralelo
+    # servidor/local es lo que evita confundir pruebas con producción.
+    logger.info(f"💾 Escribiendo en {os.getenv('DB_SERVER')}/{os.getenv('DB_NAME')}")
 
     logger.info("🚀 Supervisor iniciado")
 
     while True:
         try:
-            config = load_config()
+            # load_config consulta la BD: también fuera del event loop.
+            # Los turnos se recargan en cada ciclo: si alguien cambia un horario
+            # en la BD, se toma solo, sin botón y sin reiniciar el servicio.
+            config = await loop.run_in_executor(_db_executor, load_config)
+            await loop.run_in_executor(_db_executor, refresh_shifts_config)
 
             if not config:
                 config_failures += 1
@@ -2256,6 +1958,31 @@ async def supervisor():
 
             ips_actuales = set(config.keys())
 
+            # Configuración VIVA: en vez de pasarle una copia al lector y olvidarla,
+            # se guarda un dict por IP que se actualiza EN SU LUGAR. El lector
+            # compara '_version' en cada ciclo y se recarga solo. Así un cambio de
+            # tag se toma sin reiniciar el proceso y sin tocar las otras IPs.
+            for ip, nuevo in config.items():
+                if ip not in configs_vivas:
+                    configs_vivas[ip] = dict(nuevo, _version=1)
+                    continue
+
+                if _huella_config(nuevo) != _huella_config(configs_vivas[ip]):
+                    version = configs_vivas[ip].get('_version', 0) + 1
+                    configs_vivas[ip].clear()
+                    configs_vivas[ip].update(nuevo)
+                    configs_vivas[ip]['_version'] = version
+                    logger.info(
+                        f"🔄 Configuración de {ip} actualizada (v{version}): "
+                        f"{len(nuevo.get('estaciones', []))} estación(es), "
+                        f"{len(nuevo.get('all_addresses', []))} bloque(s). "
+                        f"El lector la tomará en el siguiente ciclo."
+                    )
+
+            for ip in list(configs_vivas):
+                if ip not in ips_actuales:
+                    del configs_vivas[ip]
+
             # Iniciar nuevas tareas para IPs que no existen
             for ip in ips_actuales:
                 if ip not in tasks:
@@ -2276,7 +2003,7 @@ async def supervisor():
                         tasks[f"{ip}_processor"] = proc_task
                     
                     # Crear tarea de lectura
-                    reader_task = asyncio.create_task(plc_reader(ip, port, config[ip]))
+                    reader_task = asyncio.create_task(plc_reader(ip, port, configs_vivas[ip]))
                     tasks[ip] = reader_task
 
             # Detener tareas para IPs que ya no existen
@@ -2602,7 +2329,8 @@ class ModernDashboardUI:
         """Filtrar estaciones por búsqueda y mostrar TODOS los lados"""
         search_text = self.search_var.get().lower()
 
-        items = sorted(system_monitor['estaciones'].items(), key=lambda x: x[0])
+        # list() antes de ordenar: snapshot frente a los hilos que mutan el dict
+        items = sorted(list(system_monitor['estaciones'].items()), key=lambda x: x[0])
 
         #  Track existing items to avoid rebuilding entire tree
         seen_items = set()
@@ -2686,13 +2414,19 @@ class ModernDashboardUI:
                 del self.station_items[key]
 
     def update_loop(self):
-        n_ips = sum(1 for ip in system_monitor['ips'].values() if ip.get('conectado'))
-        total_estaciones = len(system_monitor['estaciones'])
+        # Snapshot: el hilo de asyncio y los hilos de BD mutan system_monitor
+        # mientras la UI lo recorre. Iterar una copia evita
+        # "dictionary changed size during iteration".
+        ips_snapshot = list(system_monitor['ips'].values())
+        estaciones_snapshot = list(system_monitor['estaciones'].items())
+
+        n_ips = sum(1 for ip in ips_snapshot if ip.get('conectado'))
+        total_estaciones = len(estaciones_snapshot)
 
         n_online = 0
         n_offline = 0
 
-        for est, info in system_monitor['estaciones'].items():
+        for est, info in estaciones_snapshot:
             diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
             ip = info.get('ip', '')
             plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
@@ -2702,7 +2436,7 @@ class ModernDashboardUI:
             else:
                 n_offline += 1
 
-        self.lbl_ips.configure(text=f"🌐 IPs Online: {n_ips}/{len(system_monitor['ips'])}")
+        self.lbl_ips.configure(text=f"🌐 IPs Online: {n_ips}/{len(ips_snapshot)}")
         self.lbl_est.configure(text=f"📍 Estaciones: {total_estaciones}")
         self.lbl_online.configure(text=f"✅ Online: {n_online}")
         self.lbl_offline.configure(text=f"❌ Offline: {n_offline}")
@@ -2776,6 +2510,11 @@ def start_async():
         # Esperar a que las tareas se cancelen
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+        # 🔥 Cerrar executors antes que el pool: los hilos pueden estar usando conexiones
+        logger.info("🧵 Cerrando pools de hilos...")
+        _plc_executor.shutdown(wait=True, cancel_futures=True)
+        _db_executor.shutdown(wait=True, cancel_futures=True)
 
         # 🔥 Cerrar todas las conexiones del pool
         ConnectionPool.close_all()

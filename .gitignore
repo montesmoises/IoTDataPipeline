@@ -1,1 +1,17 @@
+# Credenciales y configuración local
 .env
+
+# Bytecode de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Estado operativo del servicio — NO versionar.
+# state_cache guarda la línea base de cada contador: si se versiona, un pull en
+# el servidor la sobrescribe con la de otra máquina y se pierde producción real.
+state_cache/
+
+# Salidas de ejecución
+logs/
+part_numbers_not_found/
