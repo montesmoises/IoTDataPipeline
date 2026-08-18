@@ -77,8 +77,12 @@ def resolver_mdi(cursor, mdi, estacion, log=None):
     if obsoletos:
         log.warning(f"⚠️ Filtrados {len(obsoletos)} número(s) obsoleto(s) del MDI {mdi}: {obsoletos}")
 
-    numeros = [f[0] for f in activos]
-    multiplicadores = {f[0]: _a_entero(f[3]) for f in activos}
+    # SIN ESPACIOS: todas las consultas aguas abajo comparan contra
+    # REPLACE(pn.number, ' ', ''), así que un número como 'BDTS28BFC -P'
+    # debe salir de aquí como 'BDTS28BFC-P' o no empatará con nada.
+    # (La consulta a AS400 hacía lo mismo con SELECT REPLACE(IUPROD, ' ', '').)
+    numeros = [_sin_espacios(f[0]) for f in activos]
+    multiplicadores = {_sin_espacios(f[0]): _a_entero(f[3]) for f in activos}
 
     log.info(f"✅ MDI {mdi} -> {numeros} en {estacion}")
     return numeros, multiplicadores, None
@@ -108,6 +112,11 @@ def obtener_multiplicador(cursor, numero_parte, estacion, log=None):
     except Exception as e:
         log.error(f"Error consultando multiplicador de {numero_parte}: {e}")
         return 1
+
+
+def _sin_espacios(numero):
+    """'BDTS28BFC -P' -> 'BDTS28BFC-P'. Ver el comentario en resolver_mdi."""
+    return str(numero or "").replace(" ", "")
 
 
 def _a_entero(valor):

@@ -128,6 +128,30 @@ class TestEstampado:
         assert EstampadoPipeline().requiere_validacion_bd() is False
 
 
+class TestNumerosSinEspacios:
+    """
+    Caso real de 2500T TR (2026-08-12): el MDI BDTS28BFC resuelve a la parte
+    'BDTS28BFC -P', que en la BD lleva un espacio. Todas las consultas aguas
+    abajo comparan contra REPLACE(pn.number,' ',''), así que el número debe
+    salir del catálogo SIN espacios o nada empata y la producción se pierde.
+    """
+
+    def test_el_validador_devuelve_numeros_sin_espacios(self):
+        from persistence.catalogo import _sin_espacios
+        assert _sin_espacios("BDTS28BFC -P") == "BDTS28BFC-P"
+        assert _sin_espacios("DGH9 53 83 XB") == "DGH95383XB"
+        assert _sin_espacios(None) == ""
+
+    def test_estampado_propaga_lo_que_da_el_catalogo(self):
+        numeros, error = EstampadoPipeline().resolver_partes(
+            "BDTS28BFC", ctx(estacion="2500T  TR",
+                             validador=lambda *a: (["BDTS28BFC-P"], None))
+        )
+        assert numeros == ["BDTS28BFC-P"]
+        assert all(" " not in n for n in numeros)
+        assert error is None
+
+
 class TestMultiplicador:
     """
     Piezas por golpe: SOLO Estampado. En las demás áreas un golpe es una pieza

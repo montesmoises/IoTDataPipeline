@@ -15,3 +15,20 @@ state_cache/
 # Salidas de ejecución
 logs/
 part_numbers_not_found/
+
+# Binarios de observabilidad y sus datos. Van en C:\iot\obs (FUERA del repo),
+# pero si alguien los descomprime aquí por error, que no acaben versionados:
+# son cientos de MB y no son código nuestro.
+obs/
+*.zip
+grafana/
+prometheus/
+promtail*
+loki*
+!deploy/grafana/
+!deploy/loki.yml
+!deploy/promtail.yml
+!deploy/prometheus.yml
+
+# Configuracion generada por iniciar-observabilidad.ps1 (rutas resueltas)
+deploy/.generado/

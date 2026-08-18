@@ -20,8 +20,7 @@ from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
 
 # CustomTkinter para la nueva UI
-import customtkinter as ctk
-from tkinter import ttk, StringVar
+import signal
 
 # Lógica de negocio pura (sin PLC ni BD). Ver domain/__init__.py
 from domain.contadores import calcular_incremento, calcular_delta_turno, piezas_producidas
@@ -29,6 +28,17 @@ from domain import turnos as _turnos
 
 # Comportamiento por área. Agregar un área = una clase + una línea. Ver areas/
 from areas import obtener_pipeline, ContextoArea
+
+# Decodificación de lo que manda el PLC. Ver plc/
+from plc.decodificador import decodificar_bloque, parse_tag
+
+# Observabilidad: estado clasificado, métricas y servidor HTTP. Ver observabilidad/
+from observabilidad import estado as obs_estado
+from observabilidad import metricas as obs_metricas
+from observabilidad import servidor as obs_servidor
+from observabilidad.estado import REGISTRO, motivo_de_error
+from observabilidad.rechazos import RechazosStore
+from observabilidad.lecturas import LECTURAS
 
 # Acceso a datos. Todo el SQL vive en persistence/repositorio.py
 from persistence import repositorio as repo
@@ -80,12 +90,11 @@ station_loggers = {}
 # Intervalo (en segundos) para volver a leer la configuración de la BD
 POLL_INTERVAL = 60  # 🚀 Aumentado a 60s (se puede forzar update manual)
 
-# Variables globales para control de actualización manual
-global_async_loop = None
-global_config_event = None
-
 # Archivo CSV de números de parte no encontrados
 CSV_FILE = CSV_DIR / "parts_not_found.csv"
+# Bitácora de rechazos en JSONL (reemplaza el CSV que se releía con pandas)
+RECHAZOS = RechazosStore(CSV_DIR / "parts_not_found.jsonl")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "9100"))
 
 #  CONFIGURACIÓN GLOBAL DE CONEXIÓN PLC
 PLC_CONNECTION_TIMEOUT = 15  # 5 segundos de timeout
@@ -445,112 +454,22 @@ def safe_get_current_shift(current_time: time) -> Tuple[int, date]:
         else:
             return 2, date.today() if current_time >= time(20, 0) else date.today() - timedelta(days=1)
 
-def registrar_error_validacion(estacion, numero_original, tipo_error):
+def registrar_error_validacion(estacion, numero_original, tipo_error,
+                               lado="--", area="", mdi=None):
     """
-    Registra e CSV los números de parte que no pasan la validación.
-    Solo registrna UNA VEZ por día (no se repite el mismo número en la misma fecha).
-    SIN TIMESTAMP - solo fecha.
+    Anota un número de parte rechazado.
+
+    Antes escribía a CSV releyendo el archivo COMPLETO con pandas en cada
+    rechazo, dentro del hilo que atiende los PLCs. Ahora es una línea JSONL con
+    el índice de duplicados en memoria. Ver observabilidad/rechazos.py
     """
+    escribio = RECHAZOS.registrar(estacion, numero_original, tipo_error,
+                                  lado=lado, area=area, mdi=mdi)
     try:
-        ts = datetime.now()
-        fecha_hoy = ts.strftime('%Y-%m-%d')  # Solo fecha, sin hora
-
-        #  LIMPIEZA EXHAUSTIVA
-        numero_original_limpio = str(numero_original)
-
-        # 1. NORMALIZAR ESPACIOS - esto es clave
-        numero_original_limpio = ' '.join(numero_original_limpio.split())
-
-        # 2. Limpiar caracteres problemáticos
-        numero_original_limpio = numero_original_limpio.replace(',', ';')
-        numero_original_limpio = numero_original_limpio.replace('\n', ' ')
-        numero_original_limpio = numero_original_limpio.replace('\r', ' ')
-        numero_original_limpio = numero_original_limpio.replace('\t', ' ')
-
-        # 3. Limitar y limpiar final
-        numero_original_limpio = numero_original_limpio[:100].strip()
-
-        # Limpiar estación
-        estacion_limpia = ' '.join(str(estacion).split()).strip()
-        tipo_error_limpio = ' '.join(str(tipo_error).split()).strip()
-
-        file_exists = CSV_FILE.exists()
-
-        #  VERIFICACIÓN DE DUPLICADOS (SOLO estacion + numero + fecha)
-        if file_exists:
-            try:
-                # Leer CSV SIN TIMESTAMP
-                existing_df = pd.read_csv(
-                    CSV_FILE,
-                    encoding='utf-8',
-                    on_bad_lines='skip',
-                    engine='python'
-                )
-
-                # Verificar columnas requeridas (sin timestamp)
-                required_columns = ['estacion', 'numero_original_plc', 'fecha']
-                if all(col in existing_df.columns for col in required_columns):
-                    #  LIMPIAR DATOS EXISTENTES
-                    existing_df['estacion'] = existing_df['estacion'].astype(str).apply(
-                        lambda x: ' '.join(str(x).split()).strip()
-                    )
-                    existing_df['numero_original_plc'] = existing_df['numero_original_plc'].astype(str).apply(
-                        lambda x: ' '.join(str(x).split()).replace(',', ';').strip()[:100]
-                    )
-                    existing_df['fecha'] = existing_df['fecha'].astype(str).str.strip()
-
-                    #  BUSCAR DUPLICADOS EXACTOS
-                    estacion_buscar = estacion_limpia
-                    numero_buscar = numero_original_limpio
-
-                    # Buscar coincidencia exacta
-                    duplicado_mask = (
-                        (existing_df['estacion'] == estacion_buscar) &
-                        (existing_df['numero_original_plc'] == numero_buscar) &
-                        (existing_df['fecha'] == fecha_hoy)
-                    )
-
-                    duplicados = existing_df[duplicado_mask]
-
-                    if not duplicados.empty:
-                        logger.info(f"ℹ️ Ya registrado HOY: {estacion_buscar} - {numero_buscar}")
-                        return False
-
-                else:
-                    logger.warning(f"⚠️ CSV no tiene columnas necesarias")
-
-            except Exception as e:
-                logger.warning(f"⚠️ Error verificando duplicados: {e}")
-                # Continuar para guardar
-
-        #  CREAR NUEVO REGISTRO SIN TIMESTAMP
-        df_nuevo = pd.DataFrame([{
-            'estacion': estacion_limpia,
-            'numero_original_plc': numero_original_limpio,
-            'tipo_error': tipo_error_limpio,
-            'fecha': fecha_hoy
-            #  NO TIMESTAMP - completamente eliminado
-        }])
-
-        #  GUARDAR
-        try:
-            df_nuevo.to_csv(
-                CSV_FILE,
-                mode='a',
-                header=not file_exists,
-                index=False,
-                encoding='utf-8'
-            )
-            logger.info(f"📝 NUEVO registro: {estacion_limpia} - {numero_original_limpio}")
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Error guardando CSV: {e}")
-            return False
-
-    except Exception as e:
-        logger.error(f"❌ Error en registrar_error_validacion: {e}")
-        return False
+        obs_metricas.partes_rechazadas.labels(estacion, tipo_error).inc()
+    except Exception:
+        pass
+    return escribio
 
 # ═══════════════════════════ HELPERS LOGGING ═══════════════════════════
 
@@ -637,8 +556,6 @@ def load_config():
             'all_addresses': set(), 'station_configs': {}, 'area': 'Default'
         })
 
-        global system_monitor
-
         for wc, ip, tag, addr, lng, area in rows:
             if not ip or not ip.strip():
                 continue
@@ -646,12 +563,6 @@ def load_config():
             if area:
                 ip_groups[ip]['area'] = area
 
-            if wc not in system_monitor['estaciones']:
-                system_monitor['estaciones'][wc] = {}
-
-            system_monitor['estaciones'][wc]['area'] = area or 'N/A'
-            if 'ip' not in system_monitor['estaciones'][wc]:
-                 system_monitor['estaciones'][wc]['ip'] = ip
 
             tag_lower = tag.lower()
             if tag_lower == "puerto":
@@ -679,7 +590,7 @@ def load_config():
             load_config.last_config_hash = None
 
         if config_hash != load_config.last_config_hash:
-            logger.info(f"📋 Configuración cargada: {len(ip_groups)} IPs, {len(system_monitor['estaciones'])} estaciones")
+            logger.info(f"📋 Configuración cargada: {len(ip_groups)} IPs")
             if load_config.last_config_hash:
                 logger.info("🔄 Configuración actualizada desde BD")
             load_config.last_config_hash = config_hash
@@ -741,27 +652,7 @@ def expand_block(address: str, length: int) -> list[str]:
     else:
         return [f"{address}{i}" for i in range(length)]
 
-def decodificar_bloque(bloque):
-    """
-    Decodifica el bloque del PLC.
-    Devuelve directamente el número limpio.
-    """
-    if not bloque:
-        return None, None, {}
-
-    chars = [chr(v & 0xFF) + chr((v >> 8) & 0xFF) for v in bloque]
-    original = "".join(chars).replace("\x00", "")
-    
-    # Filtrar caracteres no imprimibles del PLC
-    original = ''.join(c for c in original if c.isprintable()).strip()
-    
-    # limpia = original.strip()
-    limpia = original.replace(' ', '')
-
-    if not limpia:
-        return original, [], {}
-
-    return original, [limpia], {}
+# decodificar_bloque vive ahora en plc/decodificador.py
 
 # procesar_numero_parte vive ahora en domain/partes.py (importado arriba)
 
@@ -804,6 +695,16 @@ def validar_numeros_parte_estampado(mdi: str, estacion: str, log) -> tuple:
 
 # ═══════════════════════════ PATRONES STRATEGY & FACTORY ═══════════════════════════
 
+def anotar_estado(estacion, lado, motivo, **campos):
+    """Deja constancia del motivo para /estaciones/estado y para las alertas."""
+    try:
+        REGISTRO.anotar(estacion, lado, motivo, **campos)
+        obs_metricas.marcar_motivo(estacion, lado, motivo, obs_estado.MOTIVOS_POSIBLES,
+                                   area=campos.get('area', ''))
+    except Exception as e:
+        logger.debug(f"No se pudo anotar estado de {estacion}/{lado}: {e}")
+
+
 def registrar_history(cursor, pipeline, part_number_id, cantidad, fecha_fmt, tiempo, dato, log):
     """
     Inserta el detalle en histories con las columnas extra que decida el área.
@@ -829,27 +730,8 @@ class IPDataCollector:
         self._pipeline = obtener_pipeline(area)
 
     def _parse_tag(self, tag_name):
-        """Detecta tipo y grupo del tag (ej: 'Contador RH' -> 'contador', 'RH')"""
-        lower = tag_name.lower()
-        upper = tag_name.upper()
-
-        grupo = "GLOBAL"
-        if upper.endswith("LH REAR"):
-            grupo = "LH REAR"
-        elif upper.endswith("RH REAR"):
-            grupo = "RH REAR"
-        elif upper.endswith("LH"):
-            grupo = "LH"
-        elif upper.endswith("RH"):
-            grupo = "RH"
-
-        tipo = "otro"
-        if "contador" in lower: tipo = "contador"
-        elif "tiempo" in lower or "ciclo" in lower: tipo = "tiempo"
-        elif "parte" in lower or "part" in lower: tipo = "parte"
-        elif "troquel" in lower or "die" in lower: tipo = "troquel"
-
-        return tipo, grupo
+        """Detecta tipo y lado del tag. La lógica vive en plc/decodificador.py"""
+        return parse_tag(tag_name)
 
     def _merge_blocks(self, blocks, max_gap=15):
         """Agrupa bloques contiguos/cercanos para minimizar lecturas al PLC."""
@@ -1093,6 +975,16 @@ class IPDataCollector:
                     logger.warning(f"Error leyendo bloque '{head}' (len {length}) en PLC {self.ip}: {batch_error}")
                     for sub in req['sub_blocks']:
                         block_data[sub['orig']] = None
+            # Última lectura CRUDA para /debug/plc/<ip>: los words tal como
+            # llegan, antes de decodificar. Es donde se ve si viene basura.
+            try:
+                obs_servidor.registrar_lectura_cruda(self.ip, ", ".join(self.estaciones), {
+                    str(k): (v[:16] if isinstance(v, list) else v)
+                    for k, v in block_data.items()
+                })
+            except Exception:
+                pass
+
             batch = []
             now = datetime.now()
             for est in self.estaciones:
@@ -1102,44 +994,47 @@ class IPDataCollector:
                 lectura_ok = not self._lectura_degradada(cfg, block_data)
                 datos_estacion = self._process_station_data(est, cfg, block_data, now)
                 if datos_estacion:
-                    batch.append({'estacion': est, 'datos': datos_estacion, 'ts': now, 'area': self.area, 'plc_ok': lectura_ok})
-                    if est in system_monitor['estaciones']:
-                        if 'lados' not in system_monitor['estaciones'][est]:
-                            system_monitor['estaciones'][est]['lados'] = {}
-                        for dato in datos_estacion:
-                            lado = dato.get('lado', 'GLOBAL')
-                            validado_flag = dato.get('validado')
-                            error_val = dato.get('error_validacion')
-                            if validado_flag is None:
-                                prev_lados = system_monitor['estaciones'].get(est, {}).get('lados', {})
-                                if lado in prev_lados:
-                                    prev_ui = prev_lados[lado]
-                                    prev_orig = prev_ui.get('parte_actual', '').replace(' ⏳', '').replace(' ✅', '').replace(' ❌', '')
-                                    if prev_orig == dato['original']:
-                                        validado_flag = prev_ui.get('validado')
-                                        error_val = prev_ui.get('error_validacion')
-                            if validado_flag is None:
-                                status_validacion = " ⏳"
-                            elif validado_flag is True:
-                                status_validacion = " ✅"
-                            else:
-                                status_validacion = " ❌"
-                            system_monitor['estaciones'][est]['lados'][lado] = {'parte_actual': dato['original'] + status_validacion, 'contador': dato['contador'], 'tiempo_ciclo': dato['tiempo'], 'validado': validado_flag, 'error_validacion': error_val}
-                        system_monitor['estaciones'][est].update({'ultima_actualizacion': now, 'ip': self.ip})
+                    batch.append({'estacion': est, 'datos': datos_estacion, 'ts': now,
+                                  'area': self.area, 'plc_ok': lectura_ok})
                 else:
                     if not lectura_ok:
+                        try:
+                            obs_metricas.plc_lecturas.labels(self.ip, "parcial").inc()
+                        except Exception:
+                            pass
                         logger.warning(
                             f"⚠️ Lectura incompleta de {est} en PLC {self.ip}: "
                             f"se preserva el estado en caché (no se cierran registros)."
                         )
                     batch.append({'estacion': est, 'datos': [], 'ts': now, 'area': self.area, 'plc_ok': lectura_ok})
+
+            # Lecturas en vivo por estación/lado, con la MISMA conexión al PLC.
+            # Alimenta /estaciones/lecturas: ver los valores en tiempo real sin
+            # abrir una segunda conexión. Se registra lo que el PLC mandó, antes
+            # de cualquier decisión de negocio: aunque la parte se rechace o el
+            # contador no avance, aquí se ve.
+            for pkg in batch:
+                for d in pkg.get('datos', []):
+                    try:
+                        LECTURAS.anotar(
+                            pkg['estacion'], d.get('lado', '--'),
+                            ip=self.ip, area=self.area,
+                            numero_plc=d.get('original'),
+                            numero_validado=d.get('parte'),
+                            contador=d.get('contador'),
+                            tiempo_ciclo=d.get('tiempo'),
+                            troquel=d.get('troquel_id'),
+                            validado=d.get('validado'),
+                            error=d.get('error_validacion'),
+                        )
+                    except Exception:
+                        pass
+
             if batch and self.ip in ip_data_queues:
                 try:
                     ip_data_queues[self.ip].put_nowait(batch)
                 except asyncio.QueueFull:
                     logger.warning(f"Cola llena para {self.ip}, descartando batch")
-            if self.ip in system_monitor['ips']:
-                system_monitor['ips'][self.ip].update({'conectado': True, 'ultima_lectura': now})
         except OSError:
             raise  # Ya fue logueado en el bloque interno, evitar log duplicado
         except Exception as e:
@@ -1358,6 +1253,7 @@ class IPDataProcessor:
 
                 if not datos:
                     if not plc_ok:
+                        REGISTRO.anotar_estacion(estacion, obs_estado.LECTURA_PARCIAL)
                         # Lectura incompleta/fallida: NO se puede concluir que la estación
                         # dejó de producir. Se conserva el caché (línea base de contadores)
                         # para que al reconectar el delta recupere lo producido en el hueco.
@@ -1368,6 +1264,7 @@ class IPDataProcessor:
                         return
 
                     # Lectura buena y sin partes: la estación sí dejó de producir.
+                    REGISTRO.anotar_estacion(estacion, obs_estado.ESTACION_SIN_PARTES)
                     repo.cerrar_registros_de_estacion(cursor, estacion, fecha_plan, turno, fecha_fmt)
 
                     keys_to_delete = [k for k in self.active_records if k.startswith(f"{estacion}_")]
@@ -1447,7 +1344,14 @@ class IPDataProcessor:
                                 )
                             except Exception as e:
                                 log.error(f"Error cerrando registro por turno con contador detenido: {e}")
-                        continue  # El UI ya preservó el estado visual, evitamos saturar SQL Server y CSVs
+                        # El contador no avanza, pero la estación SIGUE viva: hay que
+                        # dejar constancia o desaparecería del tablero justo cuando
+                        # está parada, que es cuando más se la busca.
+                        if d.get('parte'):
+                            anotar_estado(estacion, lado_actual, obs_estado.CONTADOR_DETENIDO,
+                                          area=area, ip=self.ip, numero_plc=num_orig,
+                                          numero_validado=num, contador=cnt)
+                        continue  # evitamos saturar SQL Server con trabajo que no cambia nada
 
                     # Si es nuevo o ha cambiado, actualizamos nuestro caché antes del procesamiento pesado
                     self.last_scanned_parts[cache_key] = current_state
@@ -1456,6 +1360,10 @@ class IPDataProcessor:
 
                     if validado is False:
                         log.warning(f"⚠️ Número de parte NO VALIDADO (previamente): {num_orig} - Error: {error_val}")
+
+                        anotar_estado(estacion, lado_actual, motivo_de_error(error_val),
+                                      area=area, ip=self.ip, numero_plc=num_orig,
+                                      contador=cnt, detalle=error_val)
 
                         #  CRÍTICO: Registrar en CSV ANTES de hacer continue
                         if error_val:
@@ -1474,13 +1382,12 @@ class IPDataProcessor:
                         if new_record and new_record.get('error_bd'):
                             error_bd = new_record['error_bd']
                             log.warning(f"⚠️ Número de parte RECHAZADO EN BD: {num_orig} - Error: {error_bd}")
-                            registrar_error_validacion(estacion, num_orig, error_bd)
+                            registrar_error_validacion(estacion, num_orig, error_bd,
+                                                       lado=d.get('lado', '--'), area=area)
+                            anotar_estado(estacion, d.get('lado', '--'), motivo_de_error(error_bd),
+                                          area=area, ip=self.ip, numero_plc=num_orig,
+                                          numero_validado=num, contador=cnt, detalle=error_bd)
                             
-                            lado_actual = d.get('lado', 'GLOBAL')
-                            if estacion in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][estacion]:
-                                if lado_actual in system_monitor['estaciones'][estacion]['lados']:
-                                    system_monitor['estaciones'][estacion]['lados'][lado_actual]['parte_actual'] = f"{num_orig} ❌"
-                                    system_monitor['estaciones'][estacion]['lados'][lado_actual]['validado'] = False
                             continue
                         
                         if not new_record or new_record.get('id_registro') is None:
@@ -1510,11 +1417,6 @@ class IPDataProcessor:
                                         log.error(f"❌ Error insertando history inicial para {num}: {_e_h}")
 
                         # Si llegamos aquí, el registro se creó bien, la parte SÍ es válida en DB
-                        lado_actual = d.get('lado', 'GLOBAL')
-                        if estacion in system_monitor['estaciones'] and 'lados' in system_monitor['estaciones'][estacion]:
-                            if lado_actual in system_monitor['estaciones'][estacion]['lados']:
-                                system_monitor['estaciones'][estacion]['lados'][lado_actual]['parte_actual'] = f"{num_orig} ✅"
-                                system_monitor['estaciones'][estacion]['lados'][lado_actual]['validado'] = True
                              
                         self.active_records[clave] = new_record
                         state_changed = True
@@ -1669,6 +1571,26 @@ class IPDataProcessor:
                         reg['hora_cambio'] = hora
                         state_changed = True
 
+                        _lado = d.get('lado', '--')
+                        anotar_estado(estacion, _lado, obs_estado.PRODUCIENDO,
+                                      area=area, ip=self.ip, numero_plc=num_orig,
+                                      numero_validado=num, contador=cnt)
+                        try:
+                            obs_metricas.plc_contador.labels(estacion, _lado).set(cnt)
+                            obs_metricas.produccion_piezas.labels(estacion, _lado, str(area)).inc(delta_produccion)
+                            obs_metricas.produccion_golpes.labels(estacion, _lado, str(area)).inc(incremento_ciclo)
+                            if tiempo:
+                                obs_metricas.plc_tiempo_ciclo.labels(estacion, _lado).set(tiempo)
+                            if hubo_reset:
+                                obs_metricas.resets_contador.labels(estacion, _lado).inc()
+                        except Exception:
+                            pass
+                    else:
+                        # El contador no avanzó: la prensa está parada, no es una falla.
+                        anotar_estado(estacion, d.get('lado', '--'), obs_estado.CONTADOR_DETENIDO,
+                                      area=area, ip=self.ip, numero_plc=num_orig,
+                                      numero_validado=num, contador=cnt)
+
                 conn.commit()
                 return state_changed
 
@@ -1683,7 +1605,6 @@ class IPDataProcessor:
 
 ip_data_queues = {}
 ip_processors = {}
-system_monitor = {'ips': {}, 'estaciones': {}, 'estadisticas': {'errores_conexion': 0, 'inicio_sistema': datetime.now()}}
 
 #  NUEVO: Función para conectar al PLC con timeout
 async def connect_plc_with_timeout(plc, ip, port, timeout=PLC_CONNECTION_TIMEOUT):
@@ -1797,21 +1718,25 @@ async def plc_reader(ip, port, group_info):
                 if connected:
                     consecutive_failures = 0
                     logger.info(f"✅ Conectado a PLC {ip}:{port}")
+                    try:
+                        obs_metricas.plc_conectado.labels(ip).set(1)
+                        obs_metricas.config_version.labels(ip).set(version_config)
+                    except Exception:
+                        pass
 
                     # Actualizar monitor
-                    system_monitor['ips'][ip] = {
-                        'conectado': True,
-                        'estaciones': group_info['estaciones'],
-                        'procesando': False,
-                        'ultima_lectura': datetime.now(),
-                        'conexion_establecida': datetime.now()
-                    }
 
                     # Notificar a las estaciones
                     for est in group_info['estaciones']:
                         get_station_logger(est).info(f"✅ PLC {ip} conectado")
                 else:
                     consecutive_failures += 1
+                    try:
+                        obs_metricas.plc_conectado.labels(ip).set(0)
+                    except Exception:
+                        pass
+                    for _est in group_info.get('estaciones', []):
+                        REGISTRO.anotar_estacion(_est, obs_estado.PLC_DESCONECTADO)
                     if consecutive_failures >= max_consecutive_failures:
                         logger.error(f"❌ Múltiples fallos de conexión con PLC {ip}, esperando {RECONNECT_DELAY}s")
                         await asyncio.sleep(RECONNECT_DELAY)
@@ -1828,12 +1753,24 @@ async def plc_reader(ip, port, group_info):
                     # Leer datos
                     await collector.collect_and_enqueue(plc, group_info)
                     last_read_time = current_time
+                    try:
+                        obs_metricas.plc_lecturas.labels(ip, "ok").inc()
+                        obs_metricas.plc_ultima_lectura.labels(ip).set(current_time.timestamp())
+                    except Exception:
+                        pass
 
                 except OSError as read_error:
                     winerr = getattr(read_error, 'winerror', None) or read_error.errno
                     err_str = str(read_error)
 
                     # Timeout reconectar pero con delay corto
+                    try:
+                        obs_metricas.plc_lecturas.labels(
+                            ip, "timeout" if "timed out" in err_str else "error").inc()
+                        obs_metricas.plc_conectado.labels(ip).set(0)
+                    except Exception:
+                        pass
+
                     if "timed out" in err_str and winerr is None:
                         logger.warning(f"⏱️ Timeout leyendo PLC {ip} — cerrando socket y reconectando (delay corto)...")
                         try: plc.close()
@@ -1922,6 +1859,10 @@ async def supervisor():
     # Dejar asentado en qué base se está escribiendo: al correr en paralelo
     # servidor/local es lo que evita confundir pruebas con producción.
     logger.info(f"💾 Escribiendo en {os.getenv('DB_SERVER')}/{os.getenv('DB_NAME')}")
+
+    # Servidor de monitoreo: estado clasificado, métricas y bloque crudo del PLC.
+    obs_servidor.usar_store_rechazos(RECHAZOS)
+    obs_servidor.iniciar(HTTP_PORT)
 
     logger.info("🚀 Supervisor iniciado")
 
@@ -2022,566 +1963,88 @@ async def supervisor():
                         tasks[proc_key].cancel()
                         del tasks[proc_key]
 
-            # Espera inteligente (tiempo de poll O evento manual)
-            if global_config_event:
-                try:
-                    await asyncio.wait_for(global_config_event.wait(), timeout=POLL_INTERVAL)
-                    global_config_event.clear()
-                    logger.info("⚡ Actualización de configuración forzada por usuario")
-                except asyncio.TimeoutError:
-                    pass
-            else:
-                await asyncio.sleep(POLL_INTERVAL)
+            # La configuración se recarga sola en cada ciclo; ya no hace falta
+            # el evento que disparaba el botón de la ventana.
+            await asyncio.sleep(POLL_INTERVAL)
 
         except Exception as e:
             logger.error(f"❌ Error en supervisor: {e}")
             logger.error(traceback.format_exc())
             await asyncio.sleep(POLL_INTERVAL)
 
-# ═══════════════════════════ UI MODERNA (CustomTkinter) ═══════════════════════════
-
-class ModernDashboardUI:
-    def __init__(self):
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-
-        self.root = ctk.CTk()
-        self.root.title("🖥️ Monitor de Prensas - Sistema de Producción")
-        self.root.geometry("1400x800")
-
-        # Variables para búsqueda
-        self.search_var = StringVar()
-        self.search_var.trace('w', lambda *args: self.filter_stations())
-
-        # Diccionario para mapear estaciones a items del tree
-        self.station_items = {}
-
-        # Variable para el botón de actualizar turnos
-        self.refresh_shifts_btn = None
-        self.refresh_config_btn = None  # 🆕 Inicializar variable
-
-        self.build_ui()
-        self.update_loop()
-
-    def build_ui(self):
-        # Frame principal
-        main_frame = ctk.CTkFrame(self.root)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-        # Panel superior con estadísticas Y BOTÓN
-        stats_frame = ctk.CTkFrame(main_frame)
-        stats_frame.pack(fill="x", padx=10, pady=(10, 5))
-
-        # Frame interno para organizar mejor
-        stats_container = ctk.CTkFrame(stats_frame)
-        stats_container.pack(fill="x", padx=20, pady=15)
-
-        # Fila 1: Estadísticas
-        self.lbl_ips = ctk.CTkLabel(
-            stats_container,
-            text="🌐 IPs Online: 0/0",
-            font=("Arial", 16, "bold")
-        )
-        self.lbl_ips.grid(row=0, column=0, padx=20, pady=5, sticky="w")
-
-        self.lbl_est = ctk.CTkLabel(
-            stats_container,
-            text="📍 Estaciones: 0",
-            font=("Arial", 16, "bold")
-        )
-        self.lbl_est.grid(row=0, column=1, padx=20, pady=5, sticky="w")
-
-        self.lbl_online = ctk.CTkLabel(
-            stats_container,
-            text="✅ Online: 0",
-            font=("Arial", 16, "bold"),
-            text_color="green"
-        )
-        self.lbl_online.grid(row=0, column=2, padx=20, pady=5, sticky="w")
-
-        self.lbl_offline = ctk.CTkLabel(
-            stats_container,
-            text="❌ Offline: 0",
-            font=("Arial", 16, "bold"),
-            text_color="red"
-        )
-        self.lbl_offline.grid(row=0, column=3, padx=20, pady=5, sticky="w")
-
-        # Fila 2: Botones de actualización
-        self.refresh_shifts_btn = ctk.CTkButton(
-            stats_container,
-            text="🔄 Actualizar Turnos",
-            command=self.refresh_shifts,
-            width=180,
-            font=("Arial", 12, "bold"),
-            fg_color="#4CAF50",
-            hover_color="#45a049"
-        )
-        self.refresh_shifts_btn.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-
-        # 🆕 Botón Actualizar Configuración
-        self.refresh_config_btn = ctk.CTkButton(
-            stats_container,
-            text="⚙️ Actualizar Config",
-            command=self.refresh_config,
-            width=180,
-            font=("Arial", 12, "bold"),
-            fg_color="#2196F3",
-            hover_color="#1976D2"
-        )
-        self.refresh_config_btn.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
-
-        self.lbl_uptime = ctk.CTkLabel(
-            stats_container,
-            text="⏱️ Uptime: 00:00:00",
-            font=("Arial", 16, "bold")
-        )
-        self.lbl_uptime.grid(row=1, column=2, columnspan=2, padx=20, pady=10, sticky="w")
-
-        # Añadir label para mostrar estado de turnos
-        self.lbl_shifts_status = ctk.CTkLabel(
-            stats_container,
-            text="Turnos: No cargados",
-            font=("Arial", 12),
-            text_color="gray"
-        )
-        self.lbl_shifts_status.grid(row=2, column=0, columnspan=4, padx=20, pady=(5, 0), sticky="w")
-
-        # Panel de búsqueda
-        search_frame = ctk.CTkFrame(main_frame)
-        search_frame.pack(fill="x", padx=10, pady=5)
-
-        ctk.CTkLabel(
-            search_frame,
-            text="🔍 Buscar:",
-            font=("Arial", 14, "bold")
-        ).pack(side="left", padx=(20, 10), pady=10)
-
-        search_entry = ctk.CTkEntry(
-            search_frame,
-            textvariable=self.search_var,
-            placeholder_text="Nombre de estación o IP...",
-            width=400,
-            font=("Arial", 12)
-        )
-        search_entry.pack(side="left", padx=(0, 20), pady=10)
-
-        # Tabla de estaciones
-        tree_frame = ctk.CTkFrame(main_frame)
-        tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
-
-        # Scrollbar
-        scrollbar = ctk.CTkScrollbar(tree_frame)
-        scrollbar.pack(side="right", fill="y")
-
-        # Definir columnas (🆕 Agregada columna "Lado")
-        cols = ("Estación", "Lado", "Área", "IP", "Parte Original", "Contador", "Estado")
-
-        # Configurar estilo del Treeview
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure(
-            "Treeview",
-            background="#2b2b2b",
-            foreground="white",
-            fieldbackground="#2b2b2b",
-            rowheight=35,
-            font=("Arial", 11)
-        )
-        style.configure(
-            "Treeview.Heading",
-            background="#1f538d",
-            foreground="white",
-            font=("Arial", 12, "bold")
-        )
-        style.map('Treeview', background=[('selected', '#144870')])
-
-        self.tree = ttk.Treeview(
-            tree_frame,
-            columns=cols,
-            show="headings",
-            yscrollcommand=scrollbar.set
-        )
-        scrollbar.configure(command=self.tree.yview)
-
-        col_widths = {
-            "Estación": 200,
-            "Lado": 120,  # 🆕 Ancho para columna Lado
-            "Área": 150,
-            "IP": 150,
-            "Parte Original": 300,
-            "Contador": 120,
-            "Estado": 180
-        }
-
-        for c in cols:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=col_widths.get(c, 120), anchor="center")
-
-        self.tree.pack(fill="both", expand=True)
-
-    def refresh_shifts(self):
-        """Función para recargar configuración de turnos"""
-        # Deshabilitar botón mientras se actualiza
-        self.refresh_shifts_btn.configure(
-            text="⏳ Actualizando...",
-            state="disabled",
-            fg_color="gray"
-        )
-        self.root.update()  # Forzar actualización de UI
-
-        try:
-            # Llamar a la función de actualización
-            success = refresh_shifts_config()
-
-            if success:
-                # Mostrar confirmación temporal
-                self.lbl_shifts_status.configure(
-                    text=f"✅ Turnos actualizados: {len(SHIFTS_CONFIG)} turnos cargados",
-                    text_color="green"
-                )
-
-                # Actualizar columna de área en la tabla (si los turnos están relacionados con áreas)
-                self.update_shifts_in_table()
-
-                # Restaurar botón después de 2 segundos
-                self.root.after(2000, lambda: self.reset_shifts_button("✅ Turnos actualizados"))
-            else:
-                self.lbl_shifts_status.configure(
-                    text="❌ Error actualizando turnos",
-                    text_color="red"
-                )
-                self.root.after(2000, lambda: self.reset_shifts_button("❌ Error, reintentar"))
-
-        except Exception as e:
-            logger.error(f"❌ Error en actualización de turnos: {e}")
-            self.lbl_shifts_status.configure(
-                text="❌ Error en actualización",
-                text_color="red"
-            )
-            self.root.after(2000, lambda: self.reset_shifts_button("❌ Error, reintentar"))
-
-    def reset_shifts_button(self, text=None):
-        """Restaura el botón a su estado normal"""
-        if text is None:
-            text = "🔄 Actualizar Turnos"
-
-        self.refresh_shifts_btn.configure(
-            text=text,
-            state="normal",
-            fg_color="#4CAF50",
-            hover_color="#45a049"
-        )
-
-        # Restaurar texto del estado después de 3 segundos más
-        self.root.after(3000, lambda: self.lbl_shifts_status.configure(
-            text=f"Turnos: {len(SHIFTS_CONFIG)} cargados" if SHIFTS_CONFIG else "Turnos: No cargados",
-            text_color="gray"
-        ))
-
-    def update_shifts_in_table(self):
-        """Actualiza información de turnos en la tabla si es necesario"""
-        # Si los turnos afectan cómo se muestran las áreas, actualizar aquí
-        for estacion, info in system_monitor['estaciones'].items():
-            if estacion in self.station_items:
-                # Obtener valores actualizados
-                vals = self.get_station_values(estacion, info)
-                self.tree.item(self.station_items[estacion], values=vals)
-
-    def refresh_config(self):
-        """Forzar actualización de configuración"""
-        if global_async_loop and global_config_event:
-            self.refresh_config_btn.configure(text="⏳ Actualizando...", state="disabled", fg_color="gray")
-            
-            # Disparar evento en el loop async
-            global_async_loop.call_soon_threadsafe(global_config_event.set)
-            
-            # Restaurar botón visualmente tras breve pausa
-            self.root.after(2000, lambda: self.refresh_config_btn.configure(
-                text="⚙️ Actualizar Config", state="normal", fg_color="#2196F3"
-            ))
-        else:
-            logger.warning("⚠️ No hay loop async disponible para actualizar config")
-
-    def get_station_values(self, estacion, info):
-        """Obtiene valores formateados para una estación"""
-        diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
-        ip = info.get('ip', '--')
-        plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
-
-        if not plc_connected:
-            status = "🔴 PLC OFFLINE"
-        elif diff < 60:
-            status = "🟢 Online"
-        else:
-            status = "🟡 Sin datos"
-
-        return (
-            estacion,
-            info.get('area', 'N/A'),
-            ip,
-            info.get('parte_actual', '--'),
-            info.get('contador', 0),
-            status
-        )
-
-    def filter_stations(self):
-        """Filtrar estaciones por búsqueda y mostrar TODOS los lados"""
-        search_text = self.search_var.get().lower()
-
-        # list() antes de ordenar: snapshot frente a los hilos que mutan el dict
-        items = sorted(list(system_monitor['estaciones'].items()), key=lambda x: x[0])
-
-        #  Track existing items to avoid rebuilding entire tree
-        seen_items = set()
-
-        for est, info in items:
-            if search_text and search_text not in est.lower() and search_text not in info.get('ip', '').lower():
-                # Ocultar items de esta estación si no coincide con búsqueda
-                for key in list(self.station_items.keys()):
-                    if key.startswith(f"{est}_"):
-                        self.tree.delete(self.station_items[key])
-                        del self.station_items[key]
-                continue
-
-            diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
-
-            ip = info.get('ip', '--')
-            plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
-
-            #  Status basado en conexión PLC
-            if not plc_connected:
-                status = "🔴 PLC OFFLINE"
-            elif diff < 60:
-                status = "🟢 Online"
-            else:
-                status = "🟡 Sin datos"
-
-            # 🆕 NUEVO: Obtener todos los lados detectados
-            lados_data = info.get('lados', {})
-            
-            # Si no hay lados, mostrar info general (backward compatibility)
-            if not lados_data:
-                key = f"{est}_NO_SIDE"
-                vals = (
-                    est,
-                    "--",  # Lado (sin configurar)
-                    info.get('area', 'N/A'),
-                    ip,
-                    info.get('parte_actual', '--'),
-                    info.get('contador', 0),
-                    status
-                )
-                
-                if key in self.station_items:
-                    self.tree.item(self.station_items[key], values=vals)
-                else:
-                    item_id = self.tree.insert("", "end", values=vals)
-                    self.station_items[key] = item_id
-                seen_items.add(key)
-            else:
-                # 🆕 Mostrar UN LADO POR FILA, agrupados por estación
-                first_lado = True
-                for lado, lado_info in sorted(lados_data.items()):
-                    key = f"{est}_{lado}"
-                    
-                    # 🎨 Agrupación visual: Mostrar estación solo en la primera fila
-                    estacion_display = est if first_lado else ""
-                    
-                    vals = (
-                        estacion_display,  # 🎯 Vacío para las filas siguientes
-                        lado,              # LH, RH, etc.
-                        info.get('area', 'N/A'),
-                        ip,
-                        lado_info.get('parte_actual', '--'),
-                        lado_info.get('contador', 0),
-                        status
-                    )
-                    
-                    if key in self.station_items:
-                        self.tree.item(self.station_items[key], values=vals)
-                    else:
-                        item_id = self.tree.insert("", "end", values=vals)
-                        self.station_items[key] = item_id
-                    
-                    seen_items.add(key)
-                    first_lado = False
-
-        # Limpiar items que ya no existen
-        for key in list(self.station_items.keys()):
-            if key not in seen_items:
-                self.tree.delete(self.station_items[key])
-                del self.station_items[key]
-
-    def update_loop(self):
-        # Snapshot: el hilo de asyncio y los hilos de BD mutan system_monitor
-        # mientras la UI lo recorre. Iterar una copia evita
-        # "dictionary changed size during iteration".
-        ips_snapshot = list(system_monitor['ips'].values())
-        estaciones_snapshot = list(system_monitor['estaciones'].items())
-
-        n_ips = sum(1 for ip in ips_snapshot if ip.get('conectado'))
-        total_estaciones = len(estaciones_snapshot)
-
-        n_online = 0
-        n_offline = 0
-
-        for est, info in estaciones_snapshot:
-            diff = (datetime.now() - info.get('ultima_actualizacion', datetime.min)).total_seconds()
-            ip = info.get('ip', '')
-            plc_connected = system_monitor['ips'].get(ip, {}).get('conectado', False)
-
-            if plc_connected and diff < 60:
-                n_online += 1
-            else:
-                n_offline += 1
-
-        self.lbl_ips.configure(text=f"🌐 IPs Online: {n_ips}/{len(ips_snapshot)}")
-        self.lbl_est.configure(text=f"📍 Estaciones: {total_estaciones}")
-        self.lbl_online.configure(text=f"✅ Online: {n_online}")
-        self.lbl_offline.configure(text=f"❌ Offline: {n_offline}")
-
-        uptime = datetime.now() - system_monitor['estadisticas']['inicio_sistema']
-        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        self.lbl_uptime.configure(text=f"⏱️ Uptime: {hours:02d}:{minutes:02d}:{seconds:02d}")
-
-        # Actualizar información de turnos en UI
-        if SHIFTS_CONFIG:
-            turnos_info = ", ".join([f"{data['name']} ({data['start'].strftime('%H:%M')})"
-                                     for data in SHIFTS_CONFIG.values()][:2])
-            self.lbl_shifts_status.configure(
-                text=f"Turnos: {turnos_info}",
-                text_color="gray"
-            )
-        else:
-            self.lbl_shifts_status.configure(
-                text="Turnos: No cargados",
-                text_color="orange"
-            )
-
-        self.filter_stations()
-
-        self.root.after(1000, self.update_loop)
-
-    def run(self):
-        self.root.mainloop()
-
 # ═══════════════════════════ MAIN OPTIMIZADO ═══════════════════════════
 
-def start_async():
-    """Inicia el loop asyncio con manejo de errores mejorado"""
+def _configurar_apagado(loop):
+    """Ctrl+C y la señal de parada del servicio terminan el loop ordenadamente."""
+    def parar(*_):
+        logger.info("👋 Señal de detención recibida")
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+    try:
+        signal.signal(signal.SIGINT, parar)
+        signal.signal(signal.SIGTERM, parar)
+    except (ValueError, AttributeError):
+        pass  # sin consola (servicio de Windows): no hay señales que capturar
+
+
+def main():
+    """
+    Arranca el servicio. Sin interfaz gráfica.
+
+    Antes el proceso principal era la ventana de Tkinter y la adquisición vivía
+    en un hilo daemon: cerrar la ventana —o cerrar sesión de Windows— detenía el
+    conteo sin que nadie se enterara. Ahora el servicio es el proceso principal
+    y el monitoreo se consulta por HTTP (Grafana o curl).
+    """
+    faltantes = [v for v in ('DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD')
+                 if not os.getenv(v)]
+    if faltantes:
+        logger.error(f"❌ Faltan variables de entorno críticas: {faltantes}")
+        logger.error("   Revisa el archivo .env en la carpeta del proyecto")
+        return 1
+
+    logger.info("=" * 62)
+    logger.info(f"🏭 IoTDataPipeline · Python {sys.version.split()[0]}")
+    logger.info(f"   Monitoreo: http://localhost:{HTTP_PORT}/estaciones/estado")
+    logger.info("=" * 62)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    _configurar_apagado(loop)
 
-    # 🆕 Inicializar variables globales de control
-    global global_async_loop, global_config_event
-    global_async_loop = loop
-    
-    # Crear evento thread-safe
-    async def setup_event():
-        global global_config_event
-        global_config_event = asyncio.Event()
-    
-    loop.run_until_complete(setup_event())
-
-    #  CONFIGURAR MANEJADOR DE EXCEPCIONES NO CAPTURADAS
     def handle_exception(loop, context):
         msg = context.get("exception", context["message"])
         logger.error(f"🚨 Excepción no capturada en loop asyncio: {msg}")
 
     loop.set_exception_handler(handle_exception)
 
+    salida = 0
     try:
-        logger.info("🔄 Iniciando loop asyncio...")
         loop.run_until_complete(supervisor())
-    except KeyboardInterrupt:
-        logger.info("👋 Detención solicitada por usuario")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("👋 Detención solicitada")
     except Exception as e:
-        logger.error(f"❌ Error crítico en el loop asyncio: {e}")
+        logger.error(f"❌ Error crítico: {e}")
         logger.error(traceback.format_exc())
+        salida = 1
     finally:
-        logger.info("🛑 Cerrando loop asyncio...")
-        # Cancelar todas las tareas pendientes
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
+        logger.info("🛑 Cerrando...")
+        pendientes = asyncio.all_tasks(loop)
+        for task in pendientes:
             task.cancel()
+        if pendientes:
+            loop.run_until_complete(asyncio.gather(*pendientes, return_exceptions=True))
 
-        # Esperar a que las tareas se cancelen
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-        # 🔥 Cerrar executors antes que el pool: los hilos pueden estar usando conexiones
-        logger.info("🧵 Cerrando pools de hilos...")
+        # Los executors antes que el pool: sus hilos pueden estar usando conexiones
         _plc_executor.shutdown(wait=True, cancel_futures=True)
         _db_executor.shutdown(wait=True, cancel_futures=True)
-
-        # 🔥 Cerrar todas las conexiones del pool
         ConnectionPool.close_all()
 
         loop.close()
-        logger.info("✅ Loop asyncio cerrado correctamente")
+        logger.info("✅ Servicio detenido correctamente")
+
+    return salida
+
 
 if __name__ == '__main__':
-    #  CONFIGURAR LOGGING MÁS DETALLADO PARA DEBUG
-    debug_handler = logging.StreamHandler()
-    debug_handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    debug_handler.setFormatter(formatter)
-    logger.addHandler(debug_handler)
-
-    #  VERIFICAR VARIABLES DE ENTORNO
-    required_env_vars = ['DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-
-    if missing_vars:
-        logger.error(f"❌ Faltan variables de entorno críticas: {missing_vars}")
-        logger.error("Asegúrate de configurar el archivo .env correctamente")
-
-        # Crear una UI mínima para mostrar el error
-        ctk.set_appearance_mode("dark")
-        root = ctk.CTk()
-        root.title("ERROR - Configuración")
-        root.geometry("600x300")
-
-        error_frame = ctk.CTkFrame(root)
-        error_frame.pack(pady=50, padx=50, fill="both", expand=True)
-
-        ctk.CTkLabel(
-            error_frame,
-            text="❌ ERROR DE CONFIGURACIÓN",
-            font=("Arial", 24, "bold"),
-            text_color="red"
-        ).pack(pady=20)
-
-        ctk.CTkLabel(
-            error_frame,
-            text=f"Faltan variables de entorno: {', '.join(missing_vars)}",
-            font=("Arial", 16),
-            wraplength=500
-        ).pack(pady=10)
-
-        ctk.CTkLabel(
-            error_frame,
-            text="Verifica el archivo .env en la carpeta del proyecto",
-            font=("Arial", 14),
-            text_color="yellow"
-        ).pack(pady=10)
-
-        root.mainloop()
-    else:
-        logger.info("✅ Todas las variables de entorno críticas están configuradas")
-
-        #  INICIAR EN MODO DEBUG PARA DIAGNÓSTICO
-        logger.info("🔧 Iniciando en modo debug...")
-        logger.info(f"Python version: {sys.version}")
-
-        # Iniciar thread asíncrono
-        t = threading.Thread(target=start_async, daemon=True)
-        t.start()
-        logger.info("🧵 Thread asíncrono iniciado")
-
-        # Iniciar UI
-        logger.info("🖥️  Iniciando interfaz de usuario...")
-        app = ModernDashboardUI()
-        app.run()
+    sys.exit(main())

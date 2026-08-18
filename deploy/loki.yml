@@ -1,0 +1,41 @@
+# PLANTILLA. __APP__ y __OBS__ los resuelve iniciar-observabilidad.ps1,
+# que escribe la versión final en deploy\.generado\ (no versionada).
+# Loki en modo monolítico con almacenamiento en disco. Suficiente para una planta.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: __OBS__\datos\loki
+  storage:
+    filesystem:
+      chunks_directory: __OBS__\datos\loki\chunks
+      rules_directory: __OBS__\datos\loki\rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 720h        # 30 días
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+
+compactor:
+  working_directory: __OBS__\datos\loki\compactor
+  delete_request_store: filesystem
+  retention_enabled: true
