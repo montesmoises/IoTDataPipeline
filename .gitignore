@@ -1,0 +1,34 @@
+# Credenciales y configuración local
+.env
+
+# Bytecode de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Estado operativo del servicio — NO versionar.
+# state_cache guarda la línea base de cada contador: si se versiona, un pull en
+# el servidor la sobrescribe con la de otra máquina y se pierde producción real.
+state_cache/
+
+# Salidas de ejecución
+logs/
+part_numbers_not_found/
+
+# Binarios de observabilidad y sus datos. Van en C:\iot\obs (FUERA del repo),
+# pero si alguien los descomprime aquí por error, que no acaben versionados:
+# son cientos de MB y no son código nuestro.
+obs/
+*.zip
+grafana/
+prometheus/
+promtail*
+loki*
+!deploy/grafana/
+!deploy/loki.yml
+!deploy/promtail.yml
+!deploy/prometheus.yml
+
+# Configuracion generada por iniciar-observabilidad.ps1 (rutas resueltas)
+deploy/.generado/

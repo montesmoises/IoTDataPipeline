@@ -1,0 +1,51 @@
+# Alertas: lo que sustituye revisar el recolector a mano.
+groups:
+  - name: iotdatapipeline
+    rules:
+
+      - alert: PLCCaido
+        expr: plc_conectado == 0
+        for: 2m
+        labels: {severidad: critica}
+        annotations:
+          summary: "PLC {{ $labels.ip }} sin responder hace 2 minutos"
+
+      - alert: NumeroDeParteNoDadoDeAlta
+        expr: estacion_motivo{motivo="PARTE_NO_EXISTE"} == 1
+        for: 10m
+        labels: {severidad: alta}
+        annotations:
+          summary: "{{ $labels.estacion }}/{{ $labels.lado }} manda una parte que no existe"
+          description: "Ver el número exacto en /estaciones/estado o en el tablero de rechazos."
+
+      - alert: MDISinResolver
+        expr: estacion_motivo{motivo="MDI_SIN_RESOLVER"} == 1
+        for: 10m
+        labels: {severidad: alta}
+        annotations:
+          summary: "{{ $labels.estacion }}: el MDI del troquel no mapea a ningún número de parte"
+
+      - alert: LecturaParcialPersistente
+        expr: estacion_motivo{motivo="LECTURA_PARCIAL"} == 1
+        for: 5m
+        labels: {severidad: alta}
+        annotations:
+          summary: "{{ $labels.estacion }}: el PLC responde pero faltan bloques"
+          description: "Suele ser una dirección mal configurada en los tags."
+
+      # La que reemplaza tu revisión manual: no hay producción pero el PLC está sano.
+      - alert: SinProduccionConPLCSano
+        expr: |
+          rate(produccion_piezas_total[15m]) == 0
+          and on(estacion) (estacion_motivo{motivo="PRODUCIENDO"} == 0)
+        for: 20m
+        labels: {severidad: media}
+        annotations:
+          summary: "{{ $labels.estacion }}/{{ $labels.lado }} lleva 20 min sin registrar"
+
+      - alert: MuchosTimeouts
+        expr: rate(plc_lecturas_total{resultado="timeout"}[10m]) > 0.05
+        for: 10m
+        labels: {severidad: media}
+        annotations:
+          summary: "PLC {{ $labels.ip }} con timeouts frecuentes"

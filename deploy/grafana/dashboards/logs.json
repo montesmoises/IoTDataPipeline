@@ -1,0 +1,99 @@
+{
+  "uid": "iot-logs",
+  "title": "Logs por estación",
+  "tags": ["iot", "planta"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "time": { "from": "now-3h", "to": "now" },
+  "links": [
+    { "type": "dashboards", "title": "IoT Planta", "tags": ["iot"], "asDropdown": false, "icon": "external link" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "estacion",
+        "label": "Estación",
+        "type": "query",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "query": { "label": "estacion", "refId": "LokiVariableQueryEditor-VariableQuery", "type": 1 },
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "nivel",
+        "label": "Nivel",
+        "type": "custom",
+        "query": "INFO,WARNING,ERROR",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": ["WARNING", "ERROR"], "value": ["WARNING", "ERROR"] }
+      },
+      {
+        "name": "buscar",
+        "label": "Contiene",
+        "type": "textbox",
+        "query": "",
+        "current": { "text": "", "value": "" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries", "title": "Errores y advertencias por minuto", "id": 1,
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 0 },
+      "description": "Un pico aquí es el mejor punto de partida para buscar abajo.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (nivel) (count_over_time({job=\"estacion\", estacion=~\"$estacion\", nivel=~\"WARNING|ERROR\"}[1m]))",
+        "legendFormat": "{{nivel}}"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 0, "stacking": { "mode": "normal" } },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "ERROR" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byName", "options": "WARNING" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "logs", "title": "Logs de estación", "id": 2,
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 7 },
+      "description": "Todas las estaciones a la vez. Antes había que abrir archivo por archivo.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [{
+        "refId": "A",
+        "expr": "{job=\"estacion\", estacion=~\"$estacion\", nivel=~\"$nivel\"} |= \"$buscar\""
+      }],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "type": "logs", "title": "Supervisor (conexiones, configuración, turnos)", "id": 3,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [{ "refId": "A", "expr": "{job=\"supervisor\"}" }],
+      "options": {
+        "showTime": true, "showLabels": false, "wrapLogMessage": true,
+        "enableLogDetails": true, "sortOrder": "Descending"
+      }
+    }
+  ]
+}

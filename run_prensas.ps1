@@ -1,6 +1,5 @@
 # run_prensas.ps1
 # Cambia al directorio de tu proyecto
-Set-Location "C:\Users\Administrator\Documents\IoTDataPipeline"
+Set-Location $PSScriptRoot
 
-# Ejecuta el script con Poetry
-poetry run python Prensas.py
+poetry run python -m iotdatapipeline

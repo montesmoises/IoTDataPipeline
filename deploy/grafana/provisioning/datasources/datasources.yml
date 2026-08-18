@@ -1,0 +1,33 @@
+# Fuentes de datos. Grafana las carga sola al arrancar: no hay que darlas de
+# alta a mano. Todo corre en la misma máquina, por eso localhost.
+apiVersion: 1
+
+datasources:
+
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://localhost:3100
+    jsonData:
+      maxLines: 2000
+
+  # Lee el JSON del servicio: estado de estaciones y partes rechazadas.
+  # Requiere el plugin yesoreyeram-infinity-datasource.
+  - name: IoT Servicio
+    uid: infinity
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: http://localhost:9100
+    jsonData:
+      global_queries: []
+      is_httpheader: false

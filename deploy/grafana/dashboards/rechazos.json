@@ -1,0 +1,132 @@
+{
+  "uid": "iot-rechazos",
+  "title": "Partes rechazadas — Planta",
+  "tags": ["iot", "planta"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "time": { "from": "now-24h", "to": "now" },
+  "links": [
+    { "type": "dashboards", "title": "IoT Planta", "tags": ["iot"], "asDropdown": false, "icon": "external link" }
+  ],
+  "panels": [
+    {
+      "type": "stat", "title": "Rechazos hoy", "id": 1,
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "description": "Cada ocurrencia, no una por día: así se distingue un alta faltante de un incidente aislado.",
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
+      "targets": [{
+        "refId": "A", "type": "json", "source": "url", "format": "table",
+        "url": "/partes-rechazadas", "url_options": { "method": "GET" },
+        "root_selector": "rechazos",
+        "columns": [{ "selector": "veces", "text": "veces", "type": "number" }]
+      }],
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 50 }
+          ] }
+        }, "overrides": []
+      }
+    },
+    {
+      "type": "stat", "title": "Números distintos", "id": 2,
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
+      "targets": [{
+        "refId": "A", "type": "json", "source": "url", "format": "table",
+        "url": "/partes-rechazadas", "url_options": { "method": "GET" },
+        "root_selector": "rechazos",
+        "columns": [{ "selector": "numero_plc", "text": "numero", "type": "string" }]
+      }],
+      "options": { "reduceOptions": { "calcs": ["count"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" },
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "type": "stat", "title": "Estaciones afectadas", "id": 3,
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "count(count by (estacion) (partes_rechazadas_total))", "legendFormat": "estaciones" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } }, "overrides": [] }
+    },
+    {
+      "type": "stat", "title": "Rechazos por minuto", "id": 4,
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(partes_rechazadas_total[5m])) * 60", "legendFormat": "por minuto" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "decimals": 1, "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] }
+    },
+
+    {
+      "type": "timeseries", "title": "Rechazos por hora y motivo", "id": 10,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (tipo_error) (increase(partes_rechazadas_total[1h]))",
+        "legendFormat": "{{tipo_error}}"
+      }],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 70, "lineWidth": 0, "stacking": { "mode": "normal" } }, "color": { "mode": "palette-classic" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+
+    {
+      "type": "table", "title": "Detalle — clic en la estación abre su log", "id": 20,
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 12 },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "infinity" },
+      "targets": [{
+        "refId": "A", "type": "json", "source": "url", "format": "table",
+        "url": "/partes-rechazadas", "url_options": { "method": "GET" },
+        "root_selector": "rechazos",
+        "columns": [
+          { "selector": "ultima_vez", "text": "Última vez", "type": "string" },
+          { "selector": "estacion", "text": "Estación", "type": "string" },
+          { "selector": "lado", "text": "Lado", "type": "string" },
+          { "selector": "area", "text": "Área", "type": "string" },
+          { "selector": "numero_plc", "text": "Número del PLC", "type": "string" },
+          { "selector": "tipo_error", "text": "Motivo", "type": "string" },
+          { "selector": "veces", "text": "Veces", "type": "number" },
+          { "selector": "primera_vez", "text": "Primera vez", "type": "string" }
+        ]
+      }],
+      "options": { "showHeader": true, "cellHeight": "sm", "sortBy": [{ "displayName": "Veces", "desc": true }] },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Veces" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
+              { "id": "color", "value": { "mode": "continuous-GrYlRd" } },
+              { "id": "min", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Motivo" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } },
+              { "id": "mappings", "value": [{ "type": "value", "options": {
+                "PART_NUMBER_NO_EXISTE_BD": { "color": "red",    "index": 0 },
+                "PART_NUMBER_OBSOLETO":     { "color": "orange", "index": 1 },
+                "NO_PART_NUMBER":           { "color": "blue",   "index": 2 },
+                "NO_PART_NUMBER_ESTAMPADO": { "color": "blue",   "index": 3 },
+                "MDI_NO_EXISTE":            { "color": "purple", "index": 4 },
+                "MDI_DE_OTRA_ESTACION":     { "color": "purple", "index": 5 }
+              } }] }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Estación" },
+            "properties": [{ "id": "links", "value": [
+              { "title": "Ver logs de esta estación", "url": "/d/iot-logs?var-estacion=${__value.raw}&${__url_time_range}", "targetBlank": false }
+            ] }]
+          }
+        ]
+      }
+    }
+  ]
+}

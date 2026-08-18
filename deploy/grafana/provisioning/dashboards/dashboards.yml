@@ -1,0 +1,17 @@
+# PLANTILLA. __APP__ y __OBS__ los resuelve iniciar-observabilidad.ps1,
+# que escribe la versión final en deploy\.generado\ (no versionada).
+apiVersion: 1
+
+providers:
+  - name: IoT Planta
+    orgId: 1
+    folder: 'IoT Planta'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      # Ruta ABSOLUTA: Grafana no expande rutas relativas aquí.
+      # Es la misma en tu equipo y en el servidor porque la raíz es C:\iot
+      path: __APP__\deploy\grafana\dashboards
+      foldersFromFilesStructure: false

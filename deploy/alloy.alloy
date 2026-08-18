@@ -1,0 +1,96 @@
+// PLANTILLA. __APP__ lo resuelve iniciar-observabilidad.ps1, que escribe la
+// versión final en deploy\.generado\ (no versionada).
+//
+// Grafana Alloy: manda logs\*.log a Loki, etiquetando cada archivo con su
+// estación. Sustituye a Promtail, que Grafana descontinuó.
+//
+//   alloy.exe run alloy.alloy --storage.path=<datos>
+//
+// No hay que cambiar nada del código: lee los archivos que ya se escriben.
+
+// ── Un archivo por estación: logs\MK05.log, "logs\2500T  TR.log", ... ──────
+local.file_match "estaciones" {
+	path_targets = [{
+		__path__ = "__APP_UNIX__/logs/*.log",
+		job      = "estacion",
+	}]
+	sync_period = "10s"
+}
+
+loki.source.file "estaciones" {
+	targets    = local.file_match.estaciones.targets
+	forward_to = [loki.process.estaciones.receiver]
+}
+
+loki.process "estaciones" {
+	forward_to = [loki.write.local.receiver]
+
+	// El nombre del archivo ES el nombre de la estación
+	stage.regex {
+		source     = "filename"
+		expression = "(?P<estacion>[^\\\\/]+)\\.log$"
+	}
+
+	stage.labels {
+		values = {estacion = ""}
+	}
+
+	// 2026-08-12 16:07:16,908 - WARNING - mensaje
+	stage.regex {
+		expression = "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}),\\d+ - (?P<nivel>\\w+) - (?P<mensaje>.*)$"
+	}
+
+	stage.labels {
+		values = {nivel = ""}
+	}
+
+	stage.timestamp {
+		source   = "ts"
+		format   = "2006-01-02 15:04:05"
+		location = "America/Mexico_City"
+	}
+
+	// Descarta el ruido del ciclo: en Estampado son 4 líneas por segundo
+	stage.drop {
+		expression = "(Procesando estampado|Números validados|Contador actual|Usando cache)"
+	}
+}
+
+// ── El log del supervisor: conexiones, configuración, turnos ───────────────
+local.file_match "supervisor" {
+	path_targets = [{
+		__path__ = "__APP_UNIX__/logs/supervisor.log",
+		job      = "supervisor",
+	}]
+	sync_period = "10s"
+}
+
+loki.source.file "supervisor" {
+	targets    = local.file_match.supervisor.targets
+	forward_to = [loki.process.supervisor.receiver]
+}
+
+loki.process "supervisor" {
+	forward_to = [loki.write.local.receiver]
+
+	stage.regex {
+		expression = "^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}),\\d+ - (?P<nivel>\\w+) - (?P<mensaje>.*)$"
+	}
+
+	stage.labels {
+		values = {nivel = ""}
+	}
+
+	stage.timestamp {
+		source   = "ts"
+		format   = "2006-01-02 15:04:05"
+		location = "America/Mexico_City"
+	}
+}
+
+// ── Destino ───────────────────────────────────────────────────────────────
+loki.write "local" {
+	endpoint {
+		url = "http://localhost:3100/loki/api/v1/push"
+	}
+}
